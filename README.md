@@ -75,3 +75,8 @@ Press `prefix+i` to open the panel. Press it again, from any pane in the tab, to
 Supported: flowchart, sequence, state, class and ER diagrams. Other types show as source.
 
 If a diagram is too wide, the panel tries tighter spacing, then a top-down layout. If it still doesn't fit, it is cut at the panel's edge, and `o` opens the full diagram on GitHub.
+
+## Future enhancements
+
+- **Linear:** show your Linear issues in the same panel.
+- **Jira:** show your Jira issues in the same panel.
