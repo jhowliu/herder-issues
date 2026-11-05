@@ -1,0 +1,9 @@
+{
+  "name": "herdr-issues",
+  "private": true,
+  "type": "module",
+  "description": "Optional: lets herdr-issues draw mermaid diagrams (bin/mermaid-text.mjs).",
+  "dependencies": {
+    "beautiful-mermaid": "1.1.3"
+  }
+}

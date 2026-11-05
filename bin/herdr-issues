@@ -1,0 +1,1032 @@
+#!/usr/bin/env python3
+"""herdr-issues: a GitHub issues / PRs panel docked beside your agents.
+
+  herdr-issues toggle   open the panel right of the focused pane, or close it
+  herdr-issues panel    the TUI (run by herdr inside the plugin pane)
+
+Needs an authenticated `gh`. Python 3.9+ standard library only.
+"""
+import curses
+import json
+import locale
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+from datetime import datetime, timezone
+
+PLUGIN_ID = os.environ.get("HERDR_PLUGIN_ID") or "jhowliu.issues"
+HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"
+STATE_DIR = os.environ.get("HERDR_PLUGIN_STATE_DIR") or os.path.expanduser("~/.local/state/herdr-issues")
+PANELS_FILE = os.path.join(STATE_DIR, "panels.json")  # tab id -> panel pane id
+REFRESH_SECONDS = 60
+PANEL_WIDTH = 0.36  # share of the split the panel ends up with
+
+# ---------------------------------------------------------------- helpers
+
+
+def run(args, cwd=None, timeout=30):
+    p = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    return p.returncode, p.stdout, p.stderr
+
+
+def herdr(*args):
+    code, out, err = run([HERDR, *args])
+    try:
+        data = json.loads(out) if out.strip() else {}
+    except ValueError:
+        data = {}
+    if code != 0 or "error" in data:
+        msg = data.get("error", {}).get("message") if isinstance(data.get("error"), dict) else None
+        raise RuntimeError(msg or err.strip() or out.strip() or "herdr %s failed" % " ".join(args))
+    return data.get("result", data)
+
+
+def gh_json(args, cwd):
+    code, out, err = run(["gh", *args], cwd=cwd)
+    if code != 0:
+        raise RuntimeError((err or out).strip().splitlines()[-1] if (err or out).strip() else "gh failed")
+    return json.loads(out or "null")
+
+
+def load_panels():
+    try:
+        with open(PANELS_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_panels(panels):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = PANELS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(panels, f)
+    os.replace(tmp, PANELS_FILE)
+
+
+def char_width(ch):
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def text_width(s):
+    return sum(char_width(c) for c in s)
+
+
+def truncate(s, width):
+    """Cut s to `width` terminal cells, ending in an ellipsis when cut."""
+    if width <= 0:
+        return ""
+    if text_width(s) <= width:
+        return s
+    out, used = [], 0
+    for c in s:
+        w = char_width(c)
+        if used + w > width - 1:
+            break
+        out.append(c)
+        used += w
+    return "".join(out) + "…"
+
+
+def wrap(text, width):
+    """Wrap by terminal cells: break at spaces, hard-break long or CJK runs."""
+    width = max(width, 4)
+    lines = []
+    for para in (text or "").replace("\r", "").replace("\t", "    ").split("\n"):
+        line, used = "", 0
+        for tok in re.findall(r"\S+|\s+", para):
+            tw = text_width(tok)
+            if tok.isspace():
+                if used + tw <= width:
+                    line, used = line + tok, used + tw
+                else:
+                    lines.append(line.rstrip())
+                    line, used = "", 0
+            elif used + tw <= width:
+                line, used = line + tok, used + tw
+            elif tw <= width and line.strip():
+                lines.append(line.rstrip())
+                line, used = tok, tw
+            else:
+                for c in tok:
+                    cw = char_width(c)
+                    if used + cw > width:
+                        lines.append(line.rstrip())
+                        line, used = "", 0
+                    line, used = line + c, used + cw
+        lines.append(line.rstrip())
+    return lines
+
+
+def ago(iso):
+    if not iso:
+        return ""
+    try:
+        t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    s = max(0, (datetime.now(timezone.utc) - t).total_seconds())
+    for unit, size in (("y", 31536000), ("mo", 2592000), ("w", 604800), ("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= size:
+            return "%d%s" % (s // size, unit)
+    return "now"
+
+
+# ---------------------------------------------------------------- markdown
+# A small GitHub-flavoured markdown renderer for the detail view. Every output
+# line is a list of (text, curses attr) segments. GitHub renders a single
+# newline in issue and PR text as a line break, so source lines stay lines.
+
+ITALIC = getattr(curses, "A_ITALIC", curses.A_UNDERLINE)
+INLINE_RE = re.compile(
+    r"(?P<esc>\\[\\`*_{}\[\]()#+\-.!|>~])"
+    r"|(?P<code>(?P<ticks>`+)(?P<codetext>.+?)(?P=ticks))"
+    r"|(?P<img>!\[(?P<alt>[^\]]*)\]\([^)]*\))"
+    r"|(?P<link>\[(?P<ltext>[^\]]+)\]\((?P<href>[^)\s]+)(?:\s+\"[^\"]*\")?\))"
+    r"|(?P<auto><(?P<autourl>https?://[^>\s]+)>)"
+    r"|(?P<url>https?://[^\s<>()]*[^\s<>().,;:!?'\"])"
+    r"|(?P<bold>\*\*(?P<btext>.+?)\*\*|__(?P<btext2>.+?)__)"
+    r"|(?P<strike>~~(?P<stext>.+?)~~)"
+    r"|(?P<em>(?<![\w*])\*(?![\s*])(?P<etext>.+?)(?<![\s*])\*(?![\w*])"
+    r"|(?<![\w_])_(?![\s_])(?P<etext2>.+?)(?<![\s_])_(?![\w_]))"
+)
+HTML_TAG_RE = re.compile(
+    r"</?(?:details|summary|p|div|span|sub|sup|b|i|em|strong|kbd|a|picture|source|br|hr|img)\b[^>]*>", re.I)
+HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+)?\s*$")
+HR_RE = re.compile(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$")
+FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+LIST_RE = re.compile(r"^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$")
+QUOTE_RE = re.compile(r"^\s*>\s?(.*)$")
+TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*$")
+
+
+def recolor(attr, n):
+    """Swap the colour in attr for pair n (or-ing two colour pairs garbles both)."""
+    return (attr & ~curses.A_COLOR) | color(n)
+
+
+def inline(text, attr=0):
+    spans, pos = [], 0
+    for m in INLINE_RE.finditer(text):
+        if m.start() > pos:
+            spans.append((HTML_TAG_RE.sub("", text[pos:m.start()]), attr))
+        kind = m.lastgroup
+        if kind == "esc":
+            spans.append((m.group("esc")[1], attr))
+        elif kind == "code":
+            spans.append((m.group("codetext").strip(), recolor(attr, 4)))
+        elif kind == "img":
+            spans.append(("▣ " + (m.group("alt") or "image"), attr | curses.A_DIM))
+        elif kind == "link":
+            spans += inline(m.group("ltext"), recolor(attr, 6) | curses.A_UNDERLINE)
+        elif kind in ("auto", "url"):
+            spans.append((m.group("autourl") or m.group("url"), recolor(attr, 6) | curses.A_UNDERLINE))
+        elif kind == "bold":
+            spans += inline(m.group("btext") or m.group("btext2"), attr | curses.A_BOLD)
+        elif kind == "strike":
+            spans += inline(m.group("stext"), attr | curses.A_DIM)
+        elif kind == "em":
+            spans += inline(m.group("etext") or m.group("etext2"), attr | ITALIC)
+        pos = m.end()
+    if pos < len(text):
+        spans.append((HTML_TAG_RE.sub("", text[pos:]), attr))
+    return [s for s in spans if s[0]]
+
+
+def seg_width(segs):
+    return sum(text_width(t) for t, _ in segs)
+
+
+def merge(segs):
+    out = []
+    for t, a in segs:
+        if out and out[-1][1] == a:
+            out[-1] = (out[-1][0] + t, a)
+        elif t:
+            out.append((t, a))
+    return out
+
+
+def wrap_spans(spans, width, prefix=(), indent=()):
+    """Wrap styled spans to `width` cells. prefix starts the first line, indent the rest."""
+    words, cur = [], []
+    for text, attr in spans:
+        for tok in re.findall(r"\S+|\s+", text):
+            if tok.isspace():
+                if cur:
+                    words.append(cur)
+                    cur = []
+                words.append(None)
+            else:
+                cur.append((tok, attr))  # glued to the previous piece: `code`, stays one word
+    if cur:
+        words.append(cur)
+
+    indent = list(indent)
+    base = seg_width(indent)
+    lines = []
+    state = {"line": list(prefix), "used": seg_width(prefix), "has": False}
+
+    def flush():
+        lines.append(merge(state["line"]))
+        state.update(line=list(indent), used=base, has=False)
+
+    space = False
+    for word in words:
+        if word is None:
+            space = state["has"]
+            continue
+        ww = seg_width(word)
+        gap = 1 if space else 0
+        space = False
+        if state["used"] + gap + ww <= width:
+            if gap:
+                state["line"].append((" ", 0))
+            state["line"].extend(word)
+            state["used"] += gap + ww
+            state["has"] = True
+            continue
+        wide = ww > width - base or any(char_width(c) == 2 for t, _ in word for c in t)
+        if not wide:
+            if state["has"]:
+                flush()
+            state["line"].extend(word)
+            state["used"] += ww
+            state["has"] = True
+            continue
+        # CJK runs and over-long words fill the current line, then break anywhere
+        if gap and state["used"] + gap < width:
+            state["line"].append((" ", 0))
+            state["used"] += 1
+        for t, a in word:
+            for c in t:
+                cw = char_width(c)
+                if state["used"] + cw > width and state["has"]:
+                    flush()
+                state["line"].append((c, a))
+                state["used"] += cw
+                state["has"] = True
+    lines.append(merge(state["line"]))
+    return lines
+
+
+def hard_wrap(text, width):
+    lines, line, used = [], "", 0
+    for c in text:
+        cw = char_width(c)
+        if used + cw > width and line:
+            lines.append(line)
+            line, used = "", 0
+        line, used = line + c, used + cw
+    lines.append(line)
+    return lines
+
+
+def split_row(s):
+    s = s.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|") and not s.endswith("\\|"):
+        s = s[:-1]
+    return [c.strip() for c in re.split(r"(?<!\\)\|", s)]
+
+
+def render_table(rows, width):
+    cells = [[inline(c) for c in r] for r in rows]
+    ncol = max(len(r) for r in cells)
+    for r in cells:
+        r.extend([[]] * (ncol - len(r)))
+    head = lambda segs: [(t, a | curses.A_BOLD) for t, a in segs]
+    sep = (" │ ", curses.A_DIM)
+    widths = [max(seg_width(r[c]) for r in cells) for c in range(ncol)]
+    out = []
+    if sum(widths) + 3 * (ncol - 1) <= width:
+        for n, r in enumerate(cells):
+            line = []
+            for c in range(ncol):
+                segs = r[c] if n else head(r[c])
+                if c:
+                    line.append(sep)
+                line += segs + [(" " * (widths[c] - seg_width(segs)), 0)]
+            out.append(merge(line))
+            if n == 0:
+                out.append([("─┼─".join("─" * wd for wd in widths), curses.A_DIM)])
+        return out
+    for n, r in enumerate(cells):  # too wide to align: one wrapped line per row
+        spans = []
+        for c in range(ncol):
+            if c:
+                spans.append(sep)
+            spans += r[c] if n else head(r[c])
+        out += wrap_spans(spans, width)
+    return out
+
+
+def md_lines(md):
+    return re.sub(r"<!--.*?-->", "", md or "", flags=re.S).replace("\r", "").split("\n")
+
+
+def read_fence(src, i):
+    """Fenced block opening at src[i] -> (language, code lines, index after the block)."""
+    s = src[i].expandtabs(4).rstrip()
+    fence = FENCE_RE.match(s)
+    mark = fence.group(1)
+    lang = (s[fence.end():].split() or [""])[0].lower()
+    closing = re.compile(r"^\s*%s{%d,}\s*$" % (re.escape(mark[0]), len(mark)))
+    i += 1
+    code = []
+    while i < len(src) and not closing.match(src[i]):
+        code.append(src[i].expandtabs(4).rstrip())
+        i += 1
+    return lang, code, i + 1
+
+
+# ---------------------------------------------------------------- mermaid
+# bin/mermaid-text.mjs draws diagrams with the beautiful-mermaid npm package
+# (`npm install` in the plugin dir). Without it, mermaid blocks show as source.
+
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+MERMAID_JS = os.path.join(PLUGIN_DIR, "bin", "mermaid-text.mjs")
+_mermaid = {}  # mermaid source -> candidate drawings (lists of lines), or None if it can't be drawn
+_mermaid_hint = None  # set when the renderer isn't installed
+
+
+def prerender_mermaid(texts):
+    """Draw every mermaid block in these markdown texts with one node call. Runs off the UI thread."""
+    global _mermaid_hint
+    todo = []
+    for md in texts:
+        src, i = md_lines(md), 0
+        while i < len(src):
+            if not FENCE_RE.match(src[i]):
+                i += 1
+                continue
+            lang, code, i = read_fence(src, i)
+            key = "\n".join(code)
+            if lang == "mermaid" and key not in _mermaid and key not in todo:
+                todo.append(key)
+    if not todo:
+        return
+    setup = "(cd %s && npm install) to draw diagrams" % PLUGIN_DIR.replace(os.path.expanduser("~"), "~", 1)
+    if not shutil.which("node"):
+        _mermaid_hint = "needs node; then " + setup
+        return
+    try:
+        p = subprocess.run(["node", MERMAID_JS], input=json.dumps(todo), capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if p.returncode != 0:
+        if "beautiful-mermaid" in p.stderr:
+            _mermaid_hint = setup
+        return
+    try:
+        results = json.loads(p.stdout)
+    except ValueError:
+        return
+    _mermaid_hint = None
+    for key, drawings in zip(todo, results):
+        _mermaid[key] = [d.split("\n") for d in drawings] if drawings else None
+
+
+def draw_mermaid(code, width):
+    """The roomiest drawing that fits the width, else the narrowest one cut at the edge."""
+    drawings = _mermaid.get("\n".join(code))
+    if not drawings:
+        return None
+    widest = lambda d: max((text_width(l) for l in d), default=0)
+    pick = next((d for d in drawings if widest(d) <= width), None)
+    note = []
+    if pick is None:
+        pick = min(drawings, key=widest)
+        note = [[("  ↳ cut at the panel edge · o opens it on GitHub", curses.A_DIM)]]
+    return [[("  " + (truncate(l, width) if text_width(l) > width else l), 0)] for l in pick] + note
+
+
+def render_code(lang, code, width):
+    if lang == "mermaid":
+        drawn = draw_mermaid(code, width - 2)
+        if drawn:
+            return drawn
+    out = [[("  " + piece, color(4))] for line in code or [""] for piece in hard_wrap(line, width - 2)]
+    if lang == "mermaid" and _mermaid_hint:
+        out = wrap_spans([("mermaid: " + _mermaid_hint, curses.A_DIM)], width) + out
+    return out
+
+
+def render_markdown(md, width):
+    width = max(width, 10)
+    src = md_lines(md)
+    out = []
+    list_indent = None  # hanging indent of the list item that indented lines continue
+
+    def blank():
+        if out and out[-1]:
+            out.append([])
+
+    i = 0
+    while i < len(src):
+        raw = src[i].expandtabs(4)
+        s = raw.rstrip()
+        if FENCE_RE.match(s):
+            lang, code, i = read_fence(src, i)
+            out += render_code(lang, code, width)
+            list_indent = None
+            continue
+        if not s.strip():
+            blank()
+            i += 1
+            continue
+        m = HEADING_RE.match(s)
+        if m:
+            blank()
+            attr = recolor(curses.A_BOLD, 5) | (curses.A_UNDERLINE if len(m.group(1)) == 1 else 0)
+            out += wrap_spans(inline(m.group(2), attr), width)
+            list_indent = None
+            i += 1
+            continue
+        if HR_RE.match(s):
+            out.append([("─" * width, curses.A_DIM)])
+            list_indent = None
+            i += 1
+            continue
+        if "|" in s and i + 1 < len(src) and TABLE_SEP_RE.match(src[i + 1]):
+            rows = [split_row(s)]
+            i += 2
+            while i < len(src) and "|" in src[i] and src[i].strip():
+                rows.append(split_row(src[i]))
+                i += 1
+            out += render_table(rows, width)
+            list_indent = None
+            continue
+        m = QUOTE_RE.match(s)
+        if m:
+            inner = m.group(1)
+            bar = [("│ ", curses.A_DIM)]
+            alert = re.match(r"^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*$", inner, re.I)
+            if alert:
+                out.append(bar + [(alert.group(1).capitalize(), recolor(curses.A_BOLD, 5))])
+            elif inner.strip():
+                out += wrap_spans(inline(inner, curses.A_DIM), width, bar, bar)
+            else:
+                out.append(bar)
+            list_indent = None
+            i += 1
+            continue
+        m = LIST_RE.match(s)
+        if m:
+            level = min(len(m.group(1)) // 2, 6)
+            marker, rest = m.group(2), m.group(3)
+            task = re.match(r"^\[([ xX])\]\s+(.*)$", rest)
+            if task:
+                glyph, rest = ("☑" if task.group(1) in "xX" else "☐"), task.group(2)
+            elif marker[0].isdigit():
+                glyph = marker
+            else:
+                glyph = "•◦▪"[level % 3]
+            pad = "  " * level
+            list_indent = [(" " * (len(pad) + text_width(glyph) + 1), 0)]
+            out += wrap_spans(inline(rest), width, [(pad, 0), (glyph + " ", color(5))], list_indent)
+            i += 1
+            continue
+        if list_indent is not None and raw.startswith("  "):
+            out += wrap_spans(inline(s.strip()), width, list_indent, list_indent)
+            i += 1
+            continue
+        list_indent = None
+        out += wrap_spans(inline(s.strip()), width)
+        i += 1
+    while out and not out[-1]:
+        out.pop()
+    while out and not out[0]:
+        out.pop(0)
+    return out
+
+
+# ---------------------------------------------------------------- toggle
+
+
+def pane_exists(pane_id):
+    try:
+        herdr("pane", "get", pane_id)
+        return True
+    except RuntimeError:
+        return False
+
+
+def focused_pane():
+    pane_id = os.environ.get("HERDR_PANE_ID")
+    if pane_id:
+        try:
+            return herdr("pane", "get", pane_id)["pane"]
+        except (RuntimeError, KeyError):
+            pass
+    for p in herdr("pane", "list").get("panes", []):
+        if p.get("focused"):
+            return p
+    raise RuntimeError("no focused pane")
+
+
+def find_pane_id(obj):
+    """Pull the new pane id out of a `plugin pane open` result, whatever its nesting."""
+    if isinstance(obj, dict):
+        if isinstance(obj.get("pane_id"), str):
+            return obj["pane_id"]
+        for v in obj.values():
+            found = find_pane_id(v)
+            if found:
+                return found
+    return None
+
+
+def cmd_toggle():
+    src = focused_pane()
+    tab = src["tab_id"]
+    # Panels killed with their tab or workspace never deregister; drop them.
+    live = {p.get("pane_id") for p in herdr("pane", "list").get("panes", [])}
+    panels = {t: p for t, p in load_panels().items() if p in live}
+
+    # Pressed inside a panel, or this tab already has one: close it.
+    owner = next((t for t, p in panels.items() if p == src["pane_id"]), None)
+    target = src["pane_id"] if owner else panels.get(tab)
+    if target and pane_exists(target):
+        try:
+            herdr("plugin", "pane", "close", target)
+            panels.pop(owner or tab, None)
+            save_panels(panels)
+            return
+        except RuntimeError:
+            pass  # stale entry: that id now belongs to a non-plugin pane, so open a new panel
+    panels.pop(tab, None)
+
+    cwd = src.get("foreground_cwd") or src.get("cwd") or os.path.expanduser("~")
+    result = herdr(
+        "plugin", "pane", "open",
+        "--plugin", PLUGIN_ID, "--entrypoint", "panel",
+        "--placement", "split", "--direction", "right",
+        "--target-pane", src["pane_id"], "--cwd", cwd, "--focus",
+    )
+    new_id = find_pane_id(result)
+    if new_id:
+        panels[tab] = new_id
+        try:  # a 50/50 split is too wide for a list; give the space back
+            herdr("pane", "resize", "--direction", "right", "--amount", str(0.5 - PANEL_WIDTH), "--pane", src["pane_id"])
+        except RuntimeError:
+            pass
+    save_panels(panels)
+
+
+# ---------------------------------------------------------------- panel
+
+TABS = ("issues", "prs")
+FILTERS = ("open", "closed", "all")
+
+
+class Panel:
+    def __init__(self, cwd):
+        self.cwd = cwd
+        self.tab = "issues"
+        self.filter = "open"
+        self.repo = None
+        self.branch = None
+        self.items = {"issues": [], "prs": []}
+        self.error = None
+        self.loading = False
+        self.loaded_once = False
+        self.fetched_at = 0.0
+        self.sel = 0
+        self.top = 0
+        self.detail = None  # (kind, number) while the detail view is open
+        self.detail_data = None
+        self.detail_error = None
+        self.dscroll = 0
+        self._dcache = None
+        self.flash = ("", 0.0)
+        self.lock = threading.Lock()
+
+    # -- data
+
+    def refresh(self):
+        if self.loading:
+            return
+        self.loading = True
+        threading.Thread(target=self._fetch, daemon=True).start()
+
+    def _fetch(self):
+        try:
+            repo = gh_json(["repo", "view", "--json", "nameWithOwner,url"], self.cwd)
+            code, out, _ = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.cwd)
+            branch = out.strip() if code == 0 else None
+            issues = gh_json([
+                "issue", "list", "--state", self.filter, "--limit", "100",
+                "--json", "number,title,state,labels,assignees,author,updatedAt,url",
+            ], self.cwd)
+            prs = gh_json([
+                "pr", "list", "--state", self.filter, "--limit", "100",
+                "--json", "number,title,state,isDraft,headRefName,author,updatedAt,url,reviewDecision",
+            ], self.cwd)
+            with self.lock:
+                self.repo, self.branch, self.error = repo, branch, None
+                self.items = {"issues": issues or [], "prs": prs or []}
+                if not self.loaded_once and not issues and prs:
+                    self.tab = "prs"  # nothing to show under issues
+                self.loaded_once = True
+        except Exception as e:  # shown in the panel instead of crashing it
+            with self.lock:
+                self.error = str(e) or e.__class__.__name__
+        finally:
+            with self.lock:
+                self.loading = False
+                self.fetched_at = time.time()
+                self.clamp()
+
+    def open_detail(self):
+        item = self.current()
+        if not item:
+            return
+        kind = self.tab
+        self.detail, self.detail_data, self.detail_error, self.dscroll = (kind, item["number"]), None, None, 0
+        threading.Thread(target=self._fetch_detail, args=(kind, item["number"]), daemon=True).start()
+
+    def _fetch_detail(self, kind, number):
+        try:
+            if kind == "issues":
+                fields = "number,title,state,author,labels,assignees,body,comments,url,createdAt"
+                data = gh_json(["issue", "view", str(number), "--json", fields], self.cwd)
+            else:
+                fields = ("number,title,state,isDraft,author,labels,body,comments,url,createdAt,"
+                          "headRefName,baseRefName,additions,deletions,changedFiles,reviewDecision")
+                data = gh_json(["pr", "view", str(number), "--json", fields], self.cwd)
+            prerender_mermaid([data.get("body") or ""] + [c.get("body") or "" for c in data.get("comments") or []])
+            with self.lock:
+                if self.detail == (kind, number):
+                    self.detail_data = data
+        except Exception as e:
+            with self.lock:
+                if self.detail == (kind, number):
+                    self.detail_error = str(e)
+
+    def current(self):
+        rows = self.items.get(self.tab) or []
+        return rows[self.sel] if 0 <= self.sel < len(rows) else None
+
+    def clamp(self):
+        n = len(self.items.get(self.tab) or [])
+        self.sel = max(0, min(self.sel, n - 1))
+
+    def say(self, msg):
+        self.flash = (msg, time.time())
+
+    # -- actions
+
+    def open_in_browser(self):
+        url = (self.detail_data or {}).get("url") if self.detail else (self.current() or {}).get("url")
+        if not url:
+            return
+        opener = "open" if shutil.which("open") else "xdg-open"
+        subprocess.Popen([opener, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.say("opened in browser")
+
+    def send_to_agent(self):
+        item = self.detail_data if self.detail else self.current()
+        if not item:
+            return
+        kind = self.detail[0] if self.detail else self.tab
+        if kind == "issues":
+            text = 'GitHub issue #%s "%s" %s ' % (item["number"], item["title"], item.get("url", ""))
+        else:
+            text = 'PR #%s "%s" (%s) %s ' % (item["number"], item["title"], item.get("headRefName", ""), item.get("url", ""))
+        try:
+            agent = self.target_agent()
+            if not agent:
+                self.say("no agent in this tab")
+                return
+            herdr("pane", "send-text", agent["pane_id"], text)
+            try:  # hand focus to the agent so you can keep typing
+                herdr("agent", "focus", agent["pane_id"])
+            except RuntimeError:
+                pass
+            self.say("pasted into %s" % (agent.get("agent") or agent["pane_id"]))
+        except RuntimeError as e:
+            self.say("send failed: %s" % e)
+
+    def target_agent(self):
+        me, tab = os.environ.get("HERDR_PANE_ID"), os.environ.get("HERDR_TAB_ID")
+        agents = [a for a in herdr("agent", "list").get("agents", []) if a.get("pane_id") != me]
+        same_tab = [a for a in agents if a.get("tab_id") == tab]
+        if same_tab:
+            return same_tab[0]
+        ws = tab.split(":")[0] if tab else None
+        same_ws = [a for a in agents if a.get("workspace_id") == ws]
+        return same_ws[0] if len(same_ws) == 1 else None
+
+    # -- drawing
+
+    def draw(self, scr):
+        scr.erase()
+        h, w = scr.getmaxyx()
+        if h < 6 or w < 20:
+            put(scr, 0, 0, truncate("issues: too small", w))
+            scr.refresh()
+            return
+        with self.lock:
+            if self.detail:
+                self.draw_detail(scr, h, w)
+            else:
+                self.draw_list(scr, h, w)
+            self.draw_footer(scr, h, w)
+        scr.refresh()
+
+    def draw_header(self, scr, w):
+        name = self.repo["nameWithOwner"] if self.repo else os.path.basename(self.cwd.rstrip("/")) or self.cwd
+        status = "loading…" if self.loading else (time.strftime("%H:%M", time.localtime(self.fetched_at)) if self.fetched_at else "")
+        put(scr, 0, 1, truncate(name, w - text_width(status) - 4), curses.A_BOLD)
+        put(scr, 0, w - text_width(status) - 1, status, curses.A_DIM)
+        x = 1
+        for t in TABS:
+            label = " %s %d " % ("Issues" if t == "issues" else "PRs", len(self.items.get(t) or []))
+            attr = curses.A_REVERSE | curses.A_BOLD if t == self.tab else curses.A_DIM
+            put(scr, 1, x, label, attr)
+            x += text_width(label) + 1
+        put(scr, 1, x + 1, self.filter, color(5))
+        put(scr, 2, 0, "─" * w, curses.A_DIM)
+
+    def draw_list(self, scr, h, w):
+        self.draw_header(scr, w)
+        top_y, bottom_y = 3, h - 2  # rows [top_y, bottom_y)
+        rows = self.items.get(self.tab) or []
+        if self.error:
+            for i, line in enumerate(wrap("⚠ " + self.error, w - 2)[: bottom_y - top_y]):
+                put(scr, top_y + i, 1, line, color(3))
+            return
+        if not rows:
+            msg = "loading…" if self.loading or not self.loaded_once else "no %s %s" % (self.filter, "issues" if self.tab == "issues" else "PRs")
+            put(scr, top_y, 1, msg, curses.A_DIM)
+            return
+        per = 2  # lines per item
+        visible = max(1, (bottom_y - top_y) // per)
+        if self.sel < self.top:
+            self.top = self.sel
+        elif self.sel >= self.top + visible:
+            self.top = self.sel - visible + 1
+        for i, item in enumerate(rows[self.top: self.top + visible]):
+            idx = self.top + i
+            y = top_y + i * per
+            selected = idx == self.sel
+            num = "#%d" % item["number"]
+            age = ago(item.get("updatedAt"))
+            mark_attr, mark = self.state_mark(item)
+            base = curses.A_REVERSE if selected else 0
+            if selected:
+                put(scr, y, 0, " " * w, base)
+                put(scr, y + 1, 0, " " * w, base)
+            put(scr, y, 1, mark, mark_attr | base)
+            put(scr, y, 3, num, curses.A_BOLD | base)
+            tx = 4 + len(num)
+            put(scr, y, tx, truncate(item.get("title", ""), w - tx - len(age) - 2), base)
+            put(scr, y, w - len(age) - 1, age, curses.A_DIM | base)
+            put(scr, y + 1, 3, truncate(self.subline(item), w - 4), self.sub_attr(item) | base)
+
+    def state_mark(self, item):
+        state = (item.get("state") or "").upper()
+        if state == "MERGED":
+            return color(2), "●"
+        if state == "CLOSED":
+            return color(3), "●"
+        if item.get("isDraft"):
+            return curses.A_DIM, "○"
+        return color(1), "●"
+
+    def subline(self, item):
+        author = (item.get("author") or {}).get("login", "")
+        if self.tab == "prs":
+            parts = [item.get("headRefName", "")]
+            if item.get("isDraft"):
+                parts.append("draft")
+            review = {"APPROVED": "approved", "CHANGES_REQUESTED": "changes requested",
+                      "REVIEW_REQUIRED": "review required"}.get(item.get("reviewDecision") or "")
+            if review:
+                parts.append(review)
+            parts.append("@" + author)
+            return " · ".join(p for p in parts if p)
+        labels = ", ".join(l.get("name", "") for l in item.get("labels") or [])
+        assignees = " ".join("@" + a.get("login", "") for a in item.get("assignees") or [])
+        return " · ".join(p for p in (labels, assignees or "@" + author) if p)
+
+    def sub_attr(self, item):
+        if self.tab == "prs" and self.branch and item.get("headRefName") == self.branch:
+            return color(4)  # PR for the branch you're on
+        return curses.A_DIM
+
+    def detail_lines(self, w):
+        """Lines of (text, attr) segments; cached per item and width."""
+        key = (self.detail, w, id(self.detail_data))
+        if self._dcache and self._dcache[0] == key:
+            return self._dcache[1]
+        d = self.detail_data
+        kind = self.detail[0]
+        width = w - 2
+        out = [[(l, curses.A_BOLD)] for l in wrap("#%s %s" % (d["number"], d.get("title", "")), width)]
+        state = "DRAFT" if d.get("isDraft") else (d.get("state") or "")
+        meta = "%s · @%s · %s ago" % (state, (d.get("author") or {}).get("login", ""), ago(d.get("createdAt")))
+        out.append([(meta, self.state_mark(d)[0])])
+        if kind == "prs":
+            out.append([("%s → %s   +%s −%s · %s files" % (
+                d.get("headRefName", ""), d.get("baseRefName", ""), d.get("additions", 0),
+                d.get("deletions", 0), d.get("changedFiles", 0)), curses.A_DIM)])
+        labels = ", ".join(l.get("name", "") for l in d.get("labels") or [])
+        if labels:
+            out.append([("labels: " + labels, color(5))])
+        out.append([("─" * width, curses.A_DIM)])
+        body = (d.get("body") or "").strip()
+        out += render_markdown(body, width) if body else [[("(no description)", curses.A_DIM)]]
+        comments = d.get("comments") or []
+        if comments:
+            out.append([])
+            title = "─ %d comment%s " % (len(comments), "" if len(comments) == 1 else "s")
+            out.append([(title + "─" * max(0, width - text_width(title)), curses.A_DIM)])
+            for c in comments:
+                out.append([])
+                out.append([("@%s · %s ago" % ((c.get("author") or {}).get("login", ""), ago(c.get("createdAt"))), color(5))])
+                out += render_markdown((c.get("body") or "").strip(), width)
+        self._dcache = (key, out)
+        return out
+
+    def draw_detail(self, scr, h, w):
+        if self.detail_error:
+            put(scr, 0, 1, truncate("⚠ " + self.detail_error, w - 2), color(3))
+            return
+        if not self.detail_data:
+            put(scr, 0, 1, "loading #%s…" % self.detail[1], curses.A_DIM)
+            return
+        lines = self.detail_lines(w)
+        height = h - 1
+        self.dscroll = max(0, min(self.dscroll, len(lines) - height))
+        for i, segs in enumerate(lines[self.dscroll: self.dscroll + height]):
+            x = 1
+            for text, attr in segs:
+                put(scr, i, x, text, attr)
+                x += text_width(text)
+
+    def draw_footer(self, scr, h, w):
+        msg, at = self.flash
+        if msg and time.time() - at < 4:
+            put(scr, h - 1, 1, truncate(msg, w - 2), color(4))
+            return
+        if self.detail:
+            hint = "j/k line  h/l page  o browser  p →agent  q back"
+        else:
+            hint = "⏎ view  o browser  p →agent  tab issues/PRs  f filter  r refresh  q quit"
+        put(scr, h - 1, 1, truncate(hint, w - 2), curses.A_DIM)
+
+    # -- input
+
+    def handle(self, key, h):
+        """Return False to quit."""
+        if self.detail:
+            page = max(1, h - 3)
+            if key in ("j", curses.KEY_DOWN):
+                self.dscroll += 1
+            elif key in ("k", curses.KEY_UP):
+                self.dscroll = max(0, self.dscroll - 1)
+            elif key in ("l", " ", "\x04", curses.KEY_NPAGE, curses.KEY_RIGHT):
+                self.dscroll += page
+            elif key in ("h", "b", "\x15", curses.KEY_PPAGE, curses.KEY_LEFT):
+                self.dscroll = max(0, self.dscroll - page)
+            elif key == "g":
+                self.dscroll = 0
+            elif key == "G":
+                self.dscroll = 10 ** 6
+            elif key == "o":
+                self.open_in_browser()
+            elif key == "p":
+                self.send_to_agent()
+            elif key in ("\x1b", "q", "\x7f", curses.KEY_BACKSPACE):
+                self.detail = self.detail_data = self.detail_error = None
+            return True
+        n = len(self.items.get(self.tab) or [])
+        if key in ("q",):
+            return False
+        if key in ("j", curses.KEY_DOWN):
+            self.sel = min(n - 1, self.sel + 1)
+        elif key in ("k", curses.KEY_UP):
+            self.sel = max(0, self.sel - 1)
+        elif key == "g":
+            self.sel = 0
+        elif key == "G":
+            self.sel = n - 1
+        elif key in ("\n", "\r", "l", curses.KEY_ENTER, curses.KEY_RIGHT):
+            self.open_detail()
+        elif key in ("\t", "]", "["):
+            self.tab = TABS[(TABS.index(self.tab) + 1) % len(TABS)]
+            self.sel = self.top = 0
+        elif key == "f":
+            self.filter = FILTERS[(FILTERS.index(self.filter) + 1) % len(FILTERS)]
+            self.sel = self.top = 0
+            with self.lock:  # don't show the previous filter's rows under the new label
+                self.items = {"issues": [], "prs": []}
+            self.refresh()
+        elif key == "r":
+            self.refresh()
+        elif key == "o":
+            self.open_in_browser()
+        elif key == "p":
+            self.send_to_agent()
+        self.clamp()
+        return True
+
+
+_colors = {}
+
+
+def color(n):
+    return _colors.get(n, 0)
+
+
+def init_colors():
+    if not curses.has_colors():
+        return
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+        bg = -1
+    except curses.error:
+        bg = curses.COLOR_BLACK
+    for n, fg in ((1, curses.COLOR_GREEN), (2, curses.COLOR_MAGENTA), (3, curses.COLOR_RED),
+                  (4, curses.COLOR_YELLOW), (5, curses.COLOR_CYAN), (6, curses.COLOR_BLUE)):
+        curses.init_pair(n, fg, bg)
+        _colors[n] = curses.color_pair(n)
+
+
+def put(scr, y, x, text, attr=0):
+    h, w = scr.getmaxyx()
+    if y < 0 or y >= h or x >= w:
+        return
+    text = truncate(text, w - x) if text_width(text) > w - x else text
+    try:
+        scr.addstr(y, x, text, attr)
+    except curses.error:
+        pass  # writing the bottom-right cell raises after it succeeds
+
+
+def panel_main(scr, panel):
+    curses.curs_set(0)
+    init_colors()
+    scr.keypad(True)
+    scr.timeout(500)
+    panel.refresh()
+    while True:
+        if not panel.loading and time.time() - panel.fetched_at > REFRESH_SECONDS and panel.fetched_at:
+            panel.refresh()
+        panel.draw(scr)
+        try:
+            key = scr.get_wch()
+        except curses.error:
+            continue
+        except KeyboardInterrupt:
+            return
+        if key == curses.KEY_RESIZE:
+            continue
+        if not panel.handle(key, scr.getmaxyx()[0]):
+            return
+
+
+def cmd_panel():
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    tab, me = os.environ.get("HERDR_TAB_ID"), os.environ.get("HERDR_PANE_ID")
+    if tab and me:  # so toggle can find (and close) this panel
+        panels = load_panels()
+        panels[tab] = me
+        save_panels(panels)
+    try:
+        curses.wrapper(panel_main, Panel(os.getcwd()))
+    finally:
+        if tab and me:
+            panels = load_panels()
+            if panels.get(tab) == me:
+                panels.pop(tab)
+                save_panels(panels)
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "panel"
+    if cmd == "toggle":
+        cmd_toggle()
+    elif cmd == "panel":
+        cmd_panel()
+    else:
+        sys.stderr.write(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

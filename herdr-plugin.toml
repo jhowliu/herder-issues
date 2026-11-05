@@ -1,0 +1,22 @@
+id = "jhowliu.issues"
+name = "issues"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "GitHub issues and PRs for the current repo, docked beside your agents."
+platforms = ["macos", "linux"]
+
+# Bound to a key in ~/.config/herdr/config.toml. Opens the panel to the right
+# of the focused pane, or closes it when this tab already has one.
+[[actions]]
+id = "toggle"
+title = "issues panel: toggle"
+contexts = ["pane", "workspace"]
+command = ["bin/herdr-issues", "toggle"]
+
+# The panel itself. Opened by `toggle` via `herdr plugin pane open`, with the
+# focused pane's cwd so it shows that repo.
+[[panes]]
+id = "panel"
+title = "issues"
+placement = "split"
+command = ["bin/herdr-issues", "panel"]
