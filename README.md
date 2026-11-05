@@ -80,3 +80,7 @@ If a diagram is too wide, the panel tries tighter spacing, then a top-down layou
 
 - **Linear:** show your Linear issues in the same panel.
 - **Jira:** show your Jira issues in the same panel.
+
+## License
+
+[MIT](LICENSE)
