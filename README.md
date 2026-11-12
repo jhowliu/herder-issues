@@ -95,6 +95,17 @@ The list shows each issue's latest run under its title. It reads `agent-cage run
 
 Runs always use agent-cage's Docker mode. agent-cage itself knows nothing about herdr: `herdr-issues run <issue-url>` runs in the cage pane, starts `agent-cage run`, and mirrors the events agent-cage writes to `.agent-cage/runs/<run-id>/events.ndjson`. If agent-cage exits without a result, the cage pane and herdr's agent list show `crashed`.
 
+### Runs an agent starts
+
+agent-cage's `agent-cage-planner` skill starts each run with `agent-cage run` in the background, so the run shows in the panel but not in herdr's agent list. Point the skill at `herdr-issues launch` instead:
+
+```sh
+# ~/.zshrc
+export AGENT_CAGE_LAUNCHER="$HOME/Developer/herdr-issues/bin/herdr-issues launch"
+```
+
+`herdr-issues launch <issue-url> --result-json <file>` takes the same arguments as `agent-cage run`. It starts `herdr-issues run` in the cage tab, as `c` does, so herdr shows the run's stage and result. It waits for the run to end and leaves agent-cage's result in `<file>`, where the skill reads it. It exits 0 when the PR is open and 1 otherwise. Outside herdr it runs the issue in the foreground, like `agent-cage run`.
+
 ## Mermaid
 
 Supported: flowchart, sequence, state, class and ER diagrams. Other types show as source.

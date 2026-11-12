@@ -3,11 +3,17 @@
 
   herdr-issues toggle            open the panel right of the focused pane, or close it
   herdr-issues panel             the TUI (run by herdr inside the plugin pane)
-  herdr-issues run <issue-url>   run the issue with agent-cage and show its progress
+  herdr-issues run <issue-url> [--result-json FILE]
+                                 run the issue with agent-cage and show its progress
                                  in herdr (what `c` starts in the cage tab)
+  herdr-issues launch <issue-url> --result-json FILE
+                                 start that run in the cage tab, wait for it to end,
+                                 and leave agent-cage's result in FILE; outside herdr
+                                 it runs here (an AGENT_CAGE_LAUNCHER for agent-cage-planner)
 
 Needs an authenticated `gh`. Python 3.9+ standard library only.
 """
+import argparse
 import curses
 import json
 import locale
@@ -825,21 +831,50 @@ def cage_pane(cwd):
     return split["pane"]["pane_id"]
 
 
-def start_run_command(url):
-    """What `c` types into the cage pane. `exit` closes the pane once you dismiss the run."""
-    return "%s run %s; exit" % (shlex.quote(os.path.realpath(__file__)), shlex.quote(url))
+def start_run_command(url, result_json=None):
+    """What `c` and `launch` type into the cage pane. `exit` closes the pane once you dismiss the run."""
+    words = [os.path.realpath(__file__), "run", url]
+    if result_json:
+        words += ["--result-json", result_json]
+    return "%s; exit" % " ".join(shlex.quote(w) for w in words)
+
+
+# The line `run` prints when the run has ended; `launch` waits for it in the cage pane.
+FINISHED_LINE = "herdr-issues: #%d %s %s %s"
+FINISHED_PATTERN = r"herdr-issues: #\d+ "
+
+
+def parse_run_args(command, args, result_required=False):
+    """The issue URL, its number and the --result-json path, or None after printing why."""
+    parser = argparse.ArgumentParser(prog="herdr-issues %s" % command)
+    parser.add_argument("url", metavar="issue-url")
+    parser.add_argument("--result-json", required=result_required, metavar="FILE",
+                        help="where to write agent-cage's run result, as `agent-cage run --result-json` does")
+    try:
+        ns = parser.parse_args(args)
+    except SystemExit:
+        return None
+    m = re.search(r"/issues/(\d+)", ns.url)
+    if not m:
+        sys.stderr.write("herdr-issues %s: expected a GitHub issue URL, got %s\n" % (command, ns.url))
+        return None
+    return ns.url, int(m.group(1)), ns.result_json and os.path.abspath(ns.result_json)
+
+
+def write_result(path, result):
+    """Write the run result whole, so a reader never sees half of it."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".herdr-issues-", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(result, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
 
 
 def cmd_run(args):
-    if len(args) != 1:
-        sys.stderr.write("usage: herdr-issues run <issue-url>\n")
+    parsed = parse_run_args("run", args)
+    if parsed is None:
         return 2
-    url = args[0]
-    m = re.search(r"/issues/(\d+)", url)
-    if not m:
-        sys.stderr.write("herdr-issues run: expected a GitHub issue URL, got %s\n" % url)
-        return 2
-    number = int(m.group(1))
+    url, number, result_json = parsed
     root = repo_root(os.getcwd()) or os.getcwd()
     pane_id = os.environ.get("HERDR_PANE_ID") if os.environ.get("HERDR_ENV") == "1" else None
     run_id = new_run_id()
@@ -876,12 +911,14 @@ def cmd_run(args):
         pass
     if result and result.get("status") in ("succeeded", "failed"):
         final = {k: result.get(k) for k in ("runId", "status", "failureCode", "prUrl")}
+        if result_json:
+            write_result(result_json, result)
     else:
         final = {"runId": run_id, "status": "crashed", "exitCode": code}
     reporter.send(tracker.finished(final))
 
     glyph, label, _ = run_label(final)
-    print("\nherdr-issues: #%d %s %s %s" % (number, glyph, label, final.get("prUrl") or ""))
+    print("\n" + FINISHED_LINE % (number, glyph, label, final.get("prUrl") or ""))
     if pane_id and sys.stdin.isatty():
         # Holding here keeps the result in herdr's agent list until you have seen it.
         try:
@@ -889,6 +926,41 @@ def cmd_run(args):
         except (EOFError, KeyboardInterrupt):
             pass
     return code
+
+
+def cmd_launch(args):
+    """Start the run in the cage tab, so herdr shows its agent status, and wait for it to end.
+
+    It takes `agent-cage run`'s arguments and leaves the same result file, so an agent
+    that runs `agent-cage run` in the background can run this instead."""
+    parsed = parse_run_args("launch", args, result_required=True)
+    if parsed is None:
+        return 2
+    url, number, result_json = parsed
+    if os.environ.get("HERDR_ENV") != "1":
+        return cmd_run([url, "--result-json", result_json])
+    root = repo_root(os.getcwd()) or os.getcwd()
+    try:
+        os.remove(result_json)  # a stale result would read as this run's
+    except FileNotFoundError:
+        pass
+    try:
+        pane = cage_pane(root)
+        herdr("pane", "run", pane, start_run_command(url, result_json))
+    except RuntimeError as e:
+        sys.stderr.write("herdr-issues launch: cannot start the run in the cage tab: %s\n" % e)
+        return 1
+    print("herdr-issues: #%d runs in pane %s of the cage tab" % (number, pane), flush=True)
+    # No timeout: a run takes as long as it takes. If the pane closes first, this fails and ends the wait.
+    subprocess.run([HERDR, "pane", "wait-output", pane, "--regex", FINISHED_PATTERN, "--source", "recent"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    result = read_json(result_json)
+    if not result:
+        sys.stderr.write("herdr-issues launch: #%d ended without a result; see pane %s\n" % (number, pane))
+        return 1
+    glyph, label, _ = run_label(result)
+    print(FINISHED_LINE % (number, glyph, label, result.get("prUrl") or ""))
+    return 0 if result.get("status") == "succeeded" else 1
 
 
 # ---------------------------------------------------------------- panel
@@ -1436,6 +1508,8 @@ def main(argv):
         cmd_panel()
     elif cmd == "run":
         return cmd_run(argv[2:])
+    elif cmd == "launch":
+        return cmd_launch(argv[2:])
     else:
         sys.stderr.write(__doc__)
         return 2

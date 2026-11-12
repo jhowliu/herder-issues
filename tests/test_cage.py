@@ -3,6 +3,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -53,15 +54,29 @@ FAKE_AGENT_CAGE = textwrap.dedent("""\
 """)
 
 # Stands in for herdr: logs each command; FAKE_HERDR_FAIL makes every command fail.
+# `tab create` makes the cage tab's pane wX:p9. `pane wait-output` stands for the
+# run in that pane ending: it writes FAKE_PANE_RESULT, if set, to the result file
+# the pane was told to write.
 FAKE_HERDR = textwrap.dedent("""\
     #!{python}
     import json, os, sys
+    args = sys.argv[1:]
     with open(os.environ["FAKE_LOG"], "a") as f:
-        f.write(json.dumps(sys.argv[1:]) + "\\n")
+        f.write(json.dumps(args) + "\\n")
     if os.environ.get("FAKE_HERDR_FAIL"):
         print(json.dumps({{"error": {{"code": "server_unavailable", "message": "no herdr server"}}}}))
         sys.exit(1)
-    print(json.dumps({{"result": {{}}}}))
+    if args[:2] == ["tab", "create"]:
+        print(json.dumps({{"result": {{"tab": {{"tab_id": "wX:t9"}}, "root_pane": {{"pane_id": "wX:p9"}}}}}}))
+    elif args[:2] == ["pane", "wait-output"] and os.environ.get("FAKE_PANE_RESULT"):
+        with open(os.environ["FAKE_LOG"]) as f:
+            typed = [json.loads(line) for line in f if line.startswith('["pane", "run"')][-1][3]
+        path = typed.split("--result-json ")[1].split(";")[0].strip("'")
+        with open(path, "w") as f:
+            f.write(os.environ["FAKE_PANE_RESULT"])
+        print(json.dumps({{"result": {{}}}}))
+    else:
+        print(json.dumps({{"result": {{}}}}))
 """)
 
 
@@ -90,6 +105,11 @@ class FakesTestCase(unittest.TestCase):
             os.environ.pop(name, None)
         os.chdir(self.repo)
 
+    def cage_call(self):
+        """The arguments and execution mode the fake agent-cage was run with."""
+        with open(self.log + ".cage") as f:
+            return json.load(f)
+
     def tearDown(self):
         hi.HERDR, hi.AGENT_CAGE, hi.RUN_POLL_SECONDS, cwd, env = self.saved
         os.chdir(cwd)
@@ -99,7 +119,7 @@ class FakesTestCase(unittest.TestCase):
 
 
 class RunWrapperTest(FakesTestCase):
-    def run_wrapper(self, outcome):
+    def run_wrapper(self, outcome, *args):
         os.environ["FAKE_OUTCOME"] = outcome
         stderr = sys.stderr
         sys.stderr = open(os.devnull, "w")
@@ -107,7 +127,7 @@ class RunWrapperTest(FakesTestCase):
             with open(os.devnull, "w") as quiet:
                 stdout, sys.stdout = sys.stdout, quiet
                 try:
-                    code = hi.cmd_run([URL])
+                    code = hi.cmd_run([URL, *args])
                 finally:
                     sys.stdout = stdout
         finally:
@@ -128,10 +148,6 @@ class RunWrapperTest(FakesTestCase):
                     args[i] = "<seq>"
                 commands.append(args)
         return commands
-
-    def cage_call(self):
-        with open(self.log + ".cage") as f:
-            return json.load(f)
 
     def test_a_successful_run_reports_each_stage_then_the_pr(self):
         self.assertEqual(self.run_wrapper("succeeded"), 0)
@@ -205,6 +221,89 @@ def cage_run(run_id, issue_url, status, **fields):
                  "startedAt": "2026-11-12T01:00:00.000Z",
                  "finishedAt": "2026-11-12T01:05:00.000Z" if finished else None,
                  "pid": 4242, "interrupted": False}, **fields)
+
+
+class ResultJsonTest(RunWrapperTest):
+    def test_result_json_gets_agent_cages_result(self):
+        path = os.path.join(self.repo, "planner-7.json")
+
+        self.run_wrapper("succeeded", "--result-json", "planner-7.json")
+
+        with open(path) as f:
+            result = json.load(f)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["prUrl"], "https://github.com/o/r/pull/9")
+        self.assertEqual(os.listdir(self.repo), [".agent-cage", "planner-7.json"], "no temp files are left")
+
+    def test_a_crashed_run_leaves_no_result_json(self):
+        self.run_wrapper("crash", "--result-json", "planner-7.json")
+
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "planner-7.json")))
+
+
+class LaunchTest(FakesTestCase):
+    def setUp(self):
+        super().setUp()
+        os.environ["HERDR_WORKSPACE_ID"] = "wX"
+
+    def launch(self, *args):
+        with open(os.devnull, "w") as quiet:
+            stdout, stderr, sys.stdout, sys.stderr = sys.stdout, sys.stderr, quiet, quiet
+            try:
+                return hi.cmd_launch(list(args))
+            finally:
+                sys.stdout, sys.stderr = stdout, stderr
+
+    def herdr_commands(self):
+        with open(self.log) as f:
+            return [json.loads(line) for line in f]
+
+    def test_it_runs_the_issue_in_the_cage_tab_and_waits_for_the_result(self):
+        os.environ["FAKE_PANE_RESULT"] = json.dumps({"runId": "run-1", "status": "succeeded",
+                                                     "prUrl": "https://github.com/o/r/pull/9"})
+        path = os.path.join(self.repo, ".agent-cage", "runs", "planner-7.json")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as f:
+            f.write('{"status": "failed"}')  # an earlier run's
+
+        code = self.launch(URL, "--result-json", ".agent-cage/runs/planner-7.json")
+
+        self.assertEqual(code, 0)
+        commands = self.herdr_commands()
+        self.assertIn(["tab", "create", "--workspace", "wX", "--label", "cage", "--cwd", os.getcwd(), "--no-focus"],
+                      commands)
+        run = next(c for c in commands if c[:2] == ["pane", "run"])
+        self.assertEqual(run[2], "wX:p9")
+        self.assertEqual(run[3], hi.start_run_command(URL, os.path.realpath(path)))
+        wait = next(c for c in commands if c[:2] == ["pane", "wait-output"])
+        self.assertEqual(wait[2:5], ["wX:p9", "--regex", hi.FINISHED_PATTERN])
+        with open(path) as f:
+            self.assertEqual(json.load(f)["status"], "succeeded")
+
+    def test_a_failed_run_exits_1_with_its_result_in_place(self):
+        os.environ["FAKE_PANE_RESULT"] = json.dumps({"runId": "run-1", "status": "failed",
+                                                     "failureCode": "verify_failed"})
+
+        self.assertEqual(self.launch(URL, "--result-json", "planner-7.json"), 1)
+        with open(os.path.join(self.repo, "planner-7.json")) as f:
+            self.assertEqual(json.load(f)["failureCode"], "verify_failed")
+
+    def test_a_run_that_ends_without_a_result_exits_1(self):
+        self.assertEqual(self.launch(URL, "--result-json", "planner-7.json"), 1)
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "planner-7.json")))
+
+    def test_outside_herdr_it_runs_here(self):
+        os.environ.pop("HERDR_ENV")
+        os.environ["FAKE_OUTCOME"] = "succeeded"
+
+        self.assertEqual(self.launch(URL, "--result-json", "planner-7.json"), 0)
+        self.assertFalse(os.path.exists(self.log), "herdr is not called")
+        self.assertEqual(self.cage_call()["execution"], "docker")
+        with open(os.path.join(self.repo, "planner-7.json")) as f:
+            self.assertEqual(json.load(f)["status"], "succeeded")
+
+    def test_it_needs_a_result_file(self):
+        self.assertEqual(self.launch(URL), 2)
 
 
 class RunStatesTest(FakesTestCase):
@@ -295,6 +394,18 @@ class StartCommandTest(unittest.TestCase):
 
         self.assertTrue(command.endswith(" run 'https://github.com/o/r/issues/7?x=1&y=2'; exit"))
         self.assertTrue(command.startswith(os.path.realpath(os.path.join(ROOT, "bin", "herdr-issues"))))
+
+    def test_launch_passes_the_result_file_on(self):
+        command = hi.start_run_command(URL, "/repo/.agent-cage/runs/planner 7.json")
+
+        self.assertTrue(command.endswith(" run %s --result-json '/repo/.agent-cage/runs/planner 7.json'; exit" % URL))
+
+    def test_launch_waits_for_the_line_the_run_ends_with_and_not_the_typed_command(self):
+        finished = hi.FINISHED_LINE % (7, "✓", "PR opened", "https://github.com/o/r/pull/9")
+
+        self.assertRegex(finished, hi.FINISHED_PATTERN)
+        self.assertNotRegex(hi.start_run_command(URL, "/repo/r.json"), hi.FINISHED_PATTERN)
+        self.assertIsNone(re.search(hi.FINISHED_PATTERN, "herdr-issues: herdr status updates are off for this run"))
 
 
 if __name__ == "__main__":
