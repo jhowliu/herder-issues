@@ -6,7 +6,7 @@ A [herdr](https://herdr.dev) plugin that shows the GitHub issues and PRs for you
 - Descriptions and comments render as markdown.
 - Mermaid diagrams are drawn as text. This is optional; see below.
 - Press `p` on an issue to send it to the agent in the same tab.
-- Press `c` on an issue to run it with [codex-cage](https://github.com/jhowliu/codex-cage) in a background tab, and follow the run from the list.
+- Press `c` on an issue to run it with [agent-cage](https://github.com/jhowliu/agent-cage) in a background tab, and follow the run from the list.
 
 ## Requirements
 
@@ -14,7 +14,7 @@ A [herdr](https://herdr.dev) plugin that shows the GitHub issues and PRs for you
 - [`gh`](https://cli.github.com), logged in (`gh auth login`)
 - Python 3.9 or later (standard library only)
 - Optional: Node.js, for mermaid diagrams
-- Optional: [codex-cage](https://github.com/jhowliu/codex-cage) on your `PATH`, and a `.codex-cage.yml` in the repo, for `c`. Run state in the list needs a codex-cage with `runs list --json`.
+- Optional: [agent-cage](https://github.com/jhowliu/agent-cage) on your `PATH`, and a `.agent-cage.yml` in the repo, for `c`. Run state in the list needs a agent-cage with `runs list --json`.
 
 ## Install
 
@@ -59,7 +59,7 @@ Press `prefix+i` to open the panel. Press it again, from any pane in the tab, to
 | `r` | Refresh (it also refreshes every 60s) |
 | `o` | Open in the browser |
 | `p` | Send to the agent in this tab |
-| `c` | Run the issue with codex-cage |
+| `c` | Run the issue with agent-cage |
 | `q` | Close the panel |
 
 **Detail**
@@ -71,29 +71,29 @@ Press `prefix+i` to open the panel. Press it again, from any pane in the tab, to
 | `g` / `G` | Jump to top / bottom |
 | `o` | Open in the browser |
 | `p` | Send to the agent in this tab |
-| `c` | Run the issue with codex-cage |
+| `c` | Run the issue with agent-cage |
 | `q` / `Esc` | Back to the list |
 
-## Run issues with codex-cage
+## Run issues with agent-cage
 
-`c` hands an open issue to [codex-cage](https://github.com/jhowliu/codex-cage), which implements it in a Docker sandbox and opens a PR. The key shows in the footer only when `codex-cage` is on your `PATH` and the repo has a `.codex-cage.yml`.
+`c` hands an open issue to [agent-cage](https://github.com/jhowliu/agent-cage), which implements it in a Docker sandbox and opens a PR. The key shows in the footer only when `agent-cage` is on your `PATH` and the repo has a `.agent-cage.yml`.
 
-1. The panel runs `codex-cage check` on the issue. If a `## Blocked by` issue is still open, or the config is invalid, the footer says why, and nothing starts.
+1. The panel runs `agent-cage check` on the issue. If a `## Blocked by` issue is still open, or the config is invalid, the footer says why, and nothing starts.
 2. The run starts in a new pane of a tab labelled `cage`. The tab is created in the background, so your view stays where it is. More runs split the cage tab, never your own panes.
-3. While the run goes, herdr's agent list shows `codex-cage · cage` with the stage under it: `prepare`, `implement 2/3`, `verify`, `review`, `publish`, or `implement try 2`.
+3. While the run goes, herdr's agent list shows `agent-cage · cage` with the stage under it: `prepare`, `implement 2/3`, `verify`, `review`, `publish`, or `implement try 2`.
 4. When it ends, the agent shows done with `PR opened`, or blocked with the failure code, such as `verify_failed`, and herdr shows a notification. The pane waits for Enter, then closes. The cage tab closes with its last pane.
 
-The list shows each issue's latest run under its title. It reads `codex-cage runs list --json` every 2 seconds, so it shows every run in the repo, including runs an agent starts with codex-cage's delegate skill:
+The list shows each issue's latest run under its title. It reads `agent-cage runs list --json` every 2 seconds, so it shows every run in the repo, including runs an agent starts with agent-cage's `agent-cage-planner` skill:
 
 | Mark | Meaning |
 | --- | --- |
-| `◐ starting` | You pressed `c`, and codex-cage has not recorded the run yet |
-| `◐ implementing` | Running, with codex-cage's status: `cloning`, `setup`, `implementing`, `verifying`, `reviewing`, `creating pr` |
+| `◐ starting` | You pressed `c`, and agent-cage has not recorded the run yet |
+| `◐ implementing` | Running, with agent-cage's status: `cloning`, `setup`, `implementing`, `verifying`, `reviewing`, `creating pr` |
 | `✓ PR opened` | Done; the detail view shows the PR link |
-| `✗ verify_failed` | Failed with this code; run `codex-cage runs show <run-id>` in the repo for details |
+| `✗ verify_failed` | Failed with this code; run `agent-cage runs show <run-id>` in the repo for details |
 | `■ interrupted` | It never finished, and its process is gone, for example because its pane was closed |
 
-Runs always use codex-cage's Docker mode. codex-cage itself knows nothing about herdr: `herdr-issues run <issue-url>` runs in the cage pane, starts `codex-cage run`, and mirrors the events codex-cage writes to `.codex-cage/runs/<run-id>/events.ndjson`. If codex-cage exits without a result, the cage pane and herdr's agent list show `crashed`.
+Runs always use agent-cage's Docker mode. agent-cage itself knows nothing about herdr: `herdr-issues run <issue-url>` runs in the cage pane, starts `agent-cage run`, and mirrors the events agent-cage writes to `.agent-cage/runs/<run-id>/events.ndjson`. If agent-cage exits without a result, the cage pane and herdr's agent list show `crashed`.
 
 ## Mermaid
 

@@ -1,6 +1,6 @@
 id = "jhowliu.issues"
 name = "issues"
-version = "0.3.0"
+version = "0.4.0"
 min_herdr_version = "0.9.5"
 description = "GitHub issues and PRs for the current repo, docked beside your agents."
 platforms = ["macos", "linux"]

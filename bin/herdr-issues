@@ -3,7 +3,7 @@
 
   herdr-issues toggle            open the panel right of the focused pane, or close it
   herdr-issues panel             the TUI (run by herdr inside the plugin pane)
-  herdr-issues run <issue-url>   run the issue with codex-cage and show its progress
+  herdr-issues run <issue-url>   run the issue with agent-cage and show its progress
                                  in herdr (what `c` starts in the cage tab)
 
 Needs an authenticated `gh`. Python 3.9+ standard library only.
@@ -588,22 +588,22 @@ def cmd_toggle():
     save_panels(panels)
 
 
-# ---------------------------------------------------------------- codex-cage runs
-# `c` runs an issue with codex-cage (github.com/jhowliu/codex-cage) in a background
-# "cage" tab. codex-cage knows nothing about herdr: the cage pane runs
-# `herdr-issues run`, which starts `codex-cage run` and mirrors the run's events
-# (.codex-cage/runs/<run-id>/events.ndjson) into herdr's agent list. The list
-# reads run state from `codex-cage runs list --json`, so it shows every run in the
+# ---------------------------------------------------------------- agent-cage runs
+# `c` runs an issue with agent-cage (github.com/jhowliu/agent-cage) in a background
+# "cage" tab. agent-cage knows nothing about herdr: the cage pane runs
+# `herdr-issues run`, which starts `agent-cage run` and mirrors the run's events
+# (.agent-cage/runs/<run-id>/events.ndjson) into herdr's agent list. The list
+# reads run state from `agent-cage runs list --json`, so it shows every run in the
 # repo, however it was started.
 
-CODEX_CAGE = os.environ.get("CODEX_CAGE_BIN") or "codex-cage"
+AGENT_CAGE = os.environ.get("AGENT_CAGE_BIN") or "agent-cage"
 CAGE_TAB = "cage"
 CAGE_SOURCE = "herdr-issues"
-CAGE_AGENT = "codex-cage"
+CAGE_AGENT = "agent-cage"
 RUN_POLL_SECONDS = 0.5
 RUNS_REFRESH_SECONDS = 2
 RUNS_LIST_TIMEOUT = 20
-PENDING_SECONDS = 120  # how long `c` shows "starting" while codex-cage has no record of the run
+PENDING_SECONDS = 120  # how long `c` shows "starting" while agent-cage has no record of the run
 GITHUB_ISSUE_URL = re.compile(r"^https://github\.com/([^/]+/[^/]+)/issues/(\d+)(?:[/?#]|$)")
 
 
@@ -613,15 +613,15 @@ def repo_root(cwd):
 
 
 def cage_root(cwd):
-    """The repo root when codex-cage can run this repo, else None."""
+    """The repo root when agent-cage can run this repo, else None."""
     root = repo_root(cwd)
-    if root and shutil.which(CODEX_CAGE) and os.path.isfile(os.path.join(root, ".codex-cage.yml")):
+    if root and shutil.which(AGENT_CAGE) and os.path.isfile(os.path.join(root, ".agent-cage.yml")):
         return root
     return None
 
 
 def runs_dir(root):
-    return os.path.join(root, ".codex-cage", "runs")
+    return os.path.join(root, ".agent-cage", "runs")
 
 
 def read_json(path):
@@ -634,12 +634,12 @@ def read_json(path):
 
 
 def run_states(root, repo=None):
-    """Issue number -> its latest codex-cage run, from `codex-cage runs list --json`.
+    """Issue number -> its latest agent-cage run, from `agent-cage runs list --json`.
 
     Runs for another repo's issues, and Linear issues, are skipped. Any failure,
-    such as a codex-cage too old to have --json, reads as no runs."""
+    such as a agent-cage too old to have --json, reads as no runs."""
     try:
-        code, out, _ = run([CODEX_CAGE, "runs", "list", "--json"], cwd=root, timeout=RUNS_LIST_TIMEOUT)
+        code, out, _ = run([AGENT_CAGE, "runs", "list", "--json"], cwd=root, timeout=RUNS_LIST_TIMEOUT)
         runs = json.loads(out) if code == 0 else []
     except (OSError, subprocess.SubprocessError, ValueError):
         return {}
@@ -661,8 +661,8 @@ def started_at(run):
 def run_label(run):
     """(glyph, text, colour pair) that the panel shows for a run.
 
-    `run` is an entry of `codex-cage runs list --json`, {"status": "starting"}
-    while `c` waits for codex-cage to record the run, or the wrapper's final
+    `run` is an entry of `agent-cage runs list --json`, {"status": "starting"}
+    while `c` waits for agent-cage to record the run, or the wrapper's final
     result, which may be {"status": "crashed"}."""
     status = run.get("status") or "unknown"
     if status == "succeeded":
@@ -683,7 +683,7 @@ def run_active(run):
 
 
 class CageTracker:
-    """Turns codex-cage run events into herdr updates for the run's pane.
+    """Turns agent-cage run events into herdr updates for the run's pane.
 
     Updates are dicts: {"kind": "agent", "state", "message"},
     {"kind": "metadata", "title", "display"} (display is the line under the agent
@@ -724,15 +724,15 @@ class CageTracker:
             code = final.get("failureCode") or "failed"
             # The blocked icon already says it failed, so the list shows only the code.
             state, label, display, sound = "blocked", "failed: %s" % code, code, "request"
-            detail = "Inspect it with: codex-cage runs show %s" % final.get("runId")
+            detail = "Inspect it with: agent-cage runs show %s" % final.get("runId")
         else:
             state, label, display, sound = "blocked", "crashed", "crashed", "request"
-            detail = "codex-cage exited with code %s; see the cage pane" % final.get("exitCode")
+            detail = "agent-cage exited with code %s; see the cage pane" % final.get("exitCode")
         self.stage = display
         return [
             self._metadata(display),
             {"kind": "agent", "state": state, "message": "%s. %s" % (label, detail)},
-            {"kind": "notification", "title": "codex-cage %s: %s" % (self.issue_key, label), "body": detail, "sound": sound},
+            {"kind": "notification", "title": "agent-cage %s: %s" % (self.issue_key, label), "body": detail, "sound": sound},
         ]
 
     def _working(self, label):
@@ -804,7 +804,7 @@ class EventTail:
 
 
 def new_run_id():
-    """A run id in codex-cage's own format, so the wrapper knows where the events land."""
+    """A run id in agent-cage's own format, so the wrapper knows where the events land."""
     return "run-%s-%s" % (datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"), secrets.token_hex(3))
 
 
@@ -844,18 +844,18 @@ def cmd_run(args):
     pane_id = os.environ.get("HERDR_PANE_ID") if os.environ.get("HERDR_ENV") == "1" else None
     run_id = new_run_id()
     fd, result_file = tempfile.mkstemp(prefix="herdr-issues-%s-" % run_id, suffix=".json")
-    os.close(fd)  # codex-cage overwrites it; left empty, the run crashed
+    os.close(fd)  # agent-cage overwrites it; left empty, the run crashed
     tracker = CageTracker("#%d" % number)
     reporter = HerdrReporter(pane_id)
     reporter.send(tracker.started(run_id))
 
-    # Docker mode always: a delegated run gets codex-cage's sandbox, whatever the config says.
-    env = dict(os.environ, CODEX_CAGE_EXECUTION="docker")
+    # Docker mode always: a delegated run gets agent-cage's sandbox, whatever the config says.
+    env = dict(os.environ, AGENT_CAGE_EXECUTION="docker")
     try:
-        child = subprocess.Popen([CODEX_CAGE, "run", url, "--run-id", run_id, "--result-json", result_file],
+        child = subprocess.Popen([AGENT_CAGE, "run", url, "--run-id", run_id, "--result-json", result_file],
                                  cwd=root, env=env)
     except OSError as e:
-        sys.stderr.write("herdr-issues run: cannot start %s: %s\n" % (CODEX_CAGE, e))
+        sys.stderr.write("herdr-issues run: cannot start %s: %s\n" % (AGENT_CAGE, e))
         child = None
     code = 127 if child is None else None
     tail = EventTail(os.path.join(runs_dir(root), run_id, "events.ndjson"))
@@ -865,7 +865,7 @@ def cmd_run(args):
         except subprocess.TimeoutExpired:
             pass
         except KeyboardInterrupt:
-            continue  # Ctrl-C reaches codex-cage too; let it stop and report
+            continue  # Ctrl-C reaches agent-cage too; let it stop and report
         for event in tail.read():
             reporter.send(tracker.updates_for(event))
 
@@ -917,11 +917,11 @@ class Panel:
         self.dscroll = 0
         self._dcache = None
         self.flash = ("", 0.0)
-        self.cage = None  # repo root when `c` can run issues with codex-cage
+        self.cage = None  # repo root when `c` can run issues with agent-cage
         self.runs = {}  # issue number -> its latest run, see run_states()
         self.runs_at = 0.0
         self.runs_loading = False
-        self.pending = {}  # issue number -> when `c` started it, until codex-cage records the run
+        self.pending = {}  # issue number -> when `c` started it, until agent-cage records the run
         self.lock = threading.Lock()
 
     # -- data
@@ -988,7 +988,7 @@ class Panel:
                     self.detail_error = str(e)
 
     def load_runs(self):
-        """Refreshes run states in the background: `codex-cage runs list` starts node."""
+        """Refreshes run states in the background: `agent-cage runs list` starts node."""
         if self.runs_loading or not self.cage:
             return
         self.runs_loading, self.runs_at = True, time.time()
@@ -1004,7 +1004,7 @@ class Panel:
             self.runs_loading = False
 
     def with_pending(self, runs, now):
-        """Shows issues just started with `c` as starting until codex-cage records their run."""
+        """Shows issues just started with `c` as starting until agent-cage records their run."""
         for number, pressed in list(self.pending.items()):
             run = runs.get(number)
             if (run and started_at(run) >= pressed) or now - pressed > PENDING_SECONDS:
@@ -1058,14 +1058,14 @@ class Panel:
             self.say("send failed: %s" % e)
 
     def start_run(self):
-        """`c`: check the issue with codex-cage, then run it in a new pane of the cage tab."""
+        """`c`: check the issue with agent-cage, then run it in a new pane of the cage tab."""
         kind = self.detail[0] if self.detail else self.tab
         item = self.detail_data if self.detail else self.current()
         if kind != "issues" or not item:
             self.say("c runs issues, not PRs")
             return
         if not self.cage:
-            self.say("c needs codex-cage on PATH and a .codex-cage.yml in this repo")
+            self.say("c needs agent-cage on PATH and a .agent-cage.yml in this repo")
             return
         number = item["number"]
         if (item.get("state") or "").upper() != "OPEN":
@@ -1082,16 +1082,16 @@ class Panel:
 
     def _start_run(self, number, url, root):
         try:
-            _, out, err = run([CODEX_CAGE, "check", url, "--json"], cwd=root, timeout=120)
+            _, out, err = run([AGENT_CAGE, "check", url, "--json"], cwd=root, timeout=120)
             try:
                 result = json.loads(out)
             except ValueError:
                 lines = (err or out).strip().splitlines()
-                raise RuntimeError(lines[-1] if lines else "codex-cage check failed")
+                raise RuntimeError(lines[-1] if lines else "agent-cage check failed")
             findings = result.get("findings") or []
             if not result.get("ready"):
                 errors = [f.get("message") for f in findings if f.get("level") == "error"]
-                self.say("#%d not ready: %s" % (number, errors[0] if errors else "run codex-cage check"))
+                self.say("#%d not ready: %s" % (number, errors[0] if errors else "run agent-cage check"))
                 self.cancel_pending(number)
                 return
             herdr("pane", "run", cage_pane(root), start_run_command(url))
@@ -1183,7 +1183,7 @@ class Panel:
             put(scr, y, w - len(age) - 1, age, curses.A_DIM | base)
             sx = 3
             run_state = self.runs.get(item["number"]) if self.tab == "issues" else None
-            if run_state:  # the codex-cage run, ahead of labels and assignees
+            if run_state:  # the agent-cage run, ahead of labels and assignees
                 glyph, label, pair = run_label(run_state)
                 tag = "%s %s" % (glyph, label)
                 put(scr, y + 1, sx, truncate(tag, w - sx - 1), (color(pair) if pair else curses.A_DIM) | base)
@@ -1244,7 +1244,7 @@ class Panel:
             out.append([("labels: " + labels, color(5))])
         if run_state:
             glyph, label, pair = run_label(run_state)
-            tag = "codex-cage: %s %s" % (glyph, label)
+            tag = "agent-cage: %s %s" % (glyph, label)
             out += wrap_spans([(tag, color(pair) if pair else curses.A_DIM)]
                               + ([(" " + run_state["prUrl"], recolor(0, 6) | curses.A_UNDERLINE)]
                                  if run_state.get("prUrl") else []), width)

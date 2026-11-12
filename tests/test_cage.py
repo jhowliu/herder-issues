@@ -1,4 +1,4 @@
-"""Tests for running issues with codex-cage: python3 -m unittest discover tests"""
+"""Tests for running issues with agent-cage: python3 -m unittest discover tests"""
 import importlib.machinery
 import importlib.util
 import json
@@ -16,10 +16,10 @@ _loader.exec_module(hi)
 
 URL = "https://github.com/o/r/issues/7"
 
-# Stands in for codex-cage. `runs list --json` prints FAKE_RUNS. `run` writes the
+# Stands in for agent-cage. `runs list --json` prints FAKE_RUNS. `run` writes the
 # run's events and result where the real one does, then exits; FAKE_OUTCOME picks
 # how the run ends.
-FAKE_CODEX_CAGE = textwrap.dedent("""\
+FAKE_AGENT_CAGE = textwrap.dedent("""\
     #!{python}
     import json, os, sys
     args = sys.argv[1:]
@@ -29,8 +29,8 @@ FAKE_CODEX_CAGE = textwrap.dedent("""\
     run_id = args[args.index("--run-id") + 1]
     result = args[args.index("--result-json") + 1]
     with open(os.environ["FAKE_LOG"] + ".cage", "w") as f:
-        json.dump({{"args": args, "execution": os.environ.get("CODEX_CAGE_EXECUTION")}}, f)
-    os.makedirs(".codex-cage/runs/" + run_id, exist_ok=True)
+        json.dump({{"args": args, "execution": os.environ.get("AGENT_CAGE_EXECUTION")}}, f)
+    os.makedirs(".agent-cage/runs/" + run_id, exist_ok=True)
     events = [
         {{"type": "run.started", "payload": {{"issueKey": "#7", "issueTitle": "Add multiply()"}}}},
         {{"type": "stage.started", "stage": "prepare", "stageAttempt": 1, "payload": {{}}}},
@@ -40,7 +40,7 @@ FAKE_CODEX_CAGE = textwrap.dedent("""\
         {{"type": "command.started", "payload": {{"command": "npm test"}}}},
         {{"type": "stage.started", "stage": "implement", "stageAttempt": 2, "payload": {{}}}},
     ]
-    with open(".codex-cage/runs/%s/events.ndjson" % run_id, "w") as f:
+    with open(".agent-cage/runs/%s/events.ndjson" % run_id, "w") as f:
         f.writelines(json.dumps(e) + "\\n" for e in events)
     outcome = os.environ["FAKE_OUTCOME"]
     if outcome == "crash":
@@ -74,16 +74,16 @@ def script(directory, name, body):
 
 
 class FakesTestCase(unittest.TestCase):
-    """Runs each test in a fresh repo directory, with fake codex-cage and herdr executables."""
+    """Runs each test in a fresh repo directory, with fake agent-cage and herdr executables."""
 
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.repo = os.path.join(self.dir.name, "repo")
         os.makedirs(self.repo)
         self.log = os.path.join(self.dir.name, "herdr.log")
-        self.saved = (hi.HERDR, hi.CODEX_CAGE, hi.RUN_POLL_SECONDS, os.getcwd(), dict(os.environ))
+        self.saved = (hi.HERDR, hi.AGENT_CAGE, hi.RUN_POLL_SECONDS, os.getcwd(), dict(os.environ))
         hi.HERDR = script(self.dir.name, "herdr", FAKE_HERDR)
-        hi.CODEX_CAGE = script(self.dir.name, "codex-cage", FAKE_CODEX_CAGE)
+        hi.AGENT_CAGE = script(self.dir.name, "agent-cage", FAKE_AGENT_CAGE)
         hi.RUN_POLL_SECONDS = 0.05
         os.environ.update(HERDR_ENV="1", HERDR_PANE_ID="wX:p4", FAKE_LOG=self.log)
         for name in ("FAKE_HERDR_FAIL", "FAKE_RUNS", "FAKE_RUNS_EXIT"):
@@ -91,7 +91,7 @@ class FakesTestCase(unittest.TestCase):
         os.chdir(self.repo)
 
     def tearDown(self):
-        hi.HERDR, hi.CODEX_CAGE, hi.RUN_POLL_SECONDS, cwd, env = self.saved
+        hi.HERDR, hi.AGENT_CAGE, hi.RUN_POLL_SECONDS, cwd, env = self.saved
         os.chdir(cwd)
         os.environ.clear()
         os.environ.update(env)
@@ -138,9 +138,9 @@ class RunWrapperTest(FakesTestCase):
 
         cage = self.cage_call()
         run_id = cage["args"][3]
-        agent = ["pane", "report-agent", "wX:p4", "--source", "herdr-issues", "--agent", "codex-cage"]
+        agent = ["pane", "report-agent", "wX:p4", "--source", "herdr-issues", "--agent", "agent-cage"]
         meta = lambda title, display: ["pane", "report-metadata", "wX:p4", "--source", "herdr-issues",
-                                       "--agent", "codex-cage", "--title", title,
+                                       "--agent", "agent-cage", "--title", title,
                                        "--display-agent", display, "--seq", "<seq>"]
         self.assertEqual(self.herdr_commands(), [
             agent + ["--state", "working", "--message", "run " + run_id, "--seq", "<seq>"],
@@ -152,7 +152,7 @@ class RunWrapperTest(FakesTestCase):
             meta("#7 Add multiply()", "implement try 2"),
             meta("#7 Add multiply()", "PR opened"),
             agent + ["--state", "idle", "--message", "PR opened. https://github.com/o/r/pull/9", "--seq", "<seq>"],
-            ["notification", "show", "codex-cage #7: PR opened", "--body", "https://github.com/o/r/pull/9",
+            ["notification", "show", "agent-cage #7: PR opened", "--body", "https://github.com/o/r/pull/9",
              "--sound", "done"],
         ])
 
@@ -160,8 +160,8 @@ class RunWrapperTest(FakesTestCase):
         self.assertEqual(cage["execution"], "docker")
         self.assertEqual(cage["args"][:4], ["run", URL, "--run-id", run_id])
         self.assertFalse(os.path.exists(cage["args"][-1]), "the temporary result file is removed")
-        self.assertEqual(os.listdir(os.path.join(self.repo, ".codex-cage", "runs")), [run_id],
-                         "only codex-cage writes to the repo's run directory")
+        self.assertEqual(os.listdir(os.path.join(self.repo, ".agent-cage", "runs")), [run_id],
+                         "only agent-cage writes to the repo's run directory")
 
     def test_a_failed_run_is_blocked_and_asks_for_attention(self):
         self.assertEqual(self.run_wrapper("failed"), 1)
@@ -170,7 +170,7 @@ class RunWrapperTest(FakesTestCase):
         run_id = self.cage_call()["args"][3]
         self.assertEqual(commands[-3][-3], "verify_failed")  # --display-agent
         self.assertEqual(commands[-2][-4:-2], ["--message", "failed: verify_failed. Inspect it with: "
-                                               "codex-cage runs show " + run_id])
+                                               "agent-cage runs show " + run_id])
         self.assertEqual(commands[-2][8], "blocked")
         self.assertEqual(commands[-1][-1], "request")
 
@@ -179,7 +179,7 @@ class RunWrapperTest(FakesTestCase):
 
         commands = self.herdr_commands()
         self.assertEqual(commands[-3][-3], "crashed")
-        self.assertEqual(commands[-2][-4:-2], ["--message", "crashed. codex-cage exited with code 3; "
+        self.assertEqual(commands[-2][-4:-2], ["--message", "crashed. agent-cage exited with code 3; "
                                                "see the cage pane"])
         self.assertFalse(os.path.exists(self.cage_call()["args"][-1]), "the temporary result file is removed")
 
@@ -199,7 +199,7 @@ class RunWrapperTest(FakesTestCase):
 
 
 def cage_run(run_id, issue_url, status, **fields):
-    """An entry of `codex-cage runs list --json`."""
+    """An entry of `agent-cage runs list --json`."""
     finished = status in ("succeeded", "failed", "guard_failed", "aborted")
     return dict({"id": run_id, "issueUrl": issue_url, "status": status, "failureCode": None, "prUrl": None,
                  "startedAt": "2026-11-12T01:00:00.000Z",
@@ -224,13 +224,13 @@ class RunStatesTest(FakesTestCase):
         self.assertEqual(sorted(hi.run_states(self.repo)), [7, 8, 9], "without a repo, every GitHub issue")
 
     def test_without_a_working_runs_list_there_are_no_runs(self):
-        os.environ["FAKE_RUNS_EXIT"] = "1"  # e.g. a codex-cage too old to have --json
+        os.environ["FAKE_RUNS_EXIT"] = "1"  # e.g. a agent-cage too old to have --json
         self.assertEqual(hi.run_states(self.repo, "o/r"), {})
 
         os.environ.update(FAKE_RUNS="not json", FAKE_RUNS_EXIT="0")
         self.assertEqual(hi.run_states(self.repo, "o/r"), {})
 
-        hi.CODEX_CAGE = os.path.join(self.dir.name, "missing-codex-cage")
+        hi.AGENT_CAGE = os.path.join(self.dir.name, "missing-agent-cage")
         self.assertEqual(hi.run_states(self.repo, "o/r"), {})
 
     def test_labels(self):
@@ -254,7 +254,7 @@ class RunStatesTest(FakesTestCase):
 
 
 class PendingRunTest(unittest.TestCase):
-    def test_c_shows_starting_until_codex_cage_records_the_run(self):
+    def test_c_shows_starting_until_agent_cage_records_the_run(self):
         panel = hi.Panel("/nonexistent")
         pressed = 1000.0  # 1970-01-01T00:16:40Z
         earlier = {"status": "failed", "startedAt": "1970-01-01T00:16:39.000Z", "finishedAt": "x"}
@@ -270,7 +270,7 @@ class PendingRunTest(unittest.TestCase):
 
         panel.pending = {7: pressed}
         self.assertEqual(panel.with_pending({}, pressed + hi.PENDING_SECONDS + 1), {},
-                         "a run codex-cage never records stops showing as starting")
+                         "a run agent-cage never records stops showing as starting")
         self.assertEqual(panel.pending, {})
 
 
