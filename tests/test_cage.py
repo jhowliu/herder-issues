@@ -213,17 +213,6 @@ class RunWrapperTest(FakesTestCase):
 
         self.assertFalse(os.path.exists(self.log))
 
-
-def cage_run(run_id, issue_url, status, **fields):
-    """An entry of `agent-cage runs list --json`."""
-    finished = status in ("succeeded", "failed", "guard_failed", "aborted")
-    return dict({"id": run_id, "issueUrl": issue_url, "status": status, "failureCode": None, "prUrl": None,
-                 "startedAt": "2026-11-12T01:00:00.000Z",
-                 "finishedAt": "2026-11-12T01:05:00.000Z" if finished else None,
-                 "pid": 4242, "interrupted": False}, **fields)
-
-
-class ResultJsonTest(RunWrapperTest):
     def test_result_json_gets_agent_cages_result(self):
         path = os.path.join(self.repo, "planner-7.json")
 
@@ -239,6 +228,15 @@ class ResultJsonTest(RunWrapperTest):
         self.run_wrapper("crash", "--result-json", "planner-7.json")
 
         self.assertFalse(os.path.exists(os.path.join(self.repo, "planner-7.json")))
+
+
+def cage_run(run_id, issue_url, status, **fields):
+    """An entry of `agent-cage runs list --json`."""
+    finished = status in ("succeeded", "failed", "guard_failed", "aborted")
+    return dict({"id": run_id, "issueUrl": issue_url, "status": status, "failureCode": None, "prUrl": None,
+                 "startedAt": "2026-11-12T01:00:00.000Z",
+                 "finishedAt": "2026-11-12T01:05:00.000Z" if finished else None,
+                 "pid": 4242, "interrupted": False}, **fields)
 
 
 class LaunchTest(FakesTestCase):
