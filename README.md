@@ -14,7 +14,7 @@ A [herdr](https://herdr.dev) plugin that shows the GitHub issues and PRs for you
 - [`gh`](https://cli.github.com), logged in (`gh auth login`)
 - Python 3.9 or later (standard library only)
 - Optional: Node.js, for mermaid diagrams
-- Optional: [codex-cage](https://github.com/jhowliu/codex-cage) on your `PATH`, and a `.codex-cage.yml` in the repo, for `c`
+- Optional: [codex-cage](https://github.com/jhowliu/codex-cage) on your `PATH`, and a `.codex-cage.yml` in the repo, for `c`. Run state in the list needs a codex-cage with `runs list --json`.
 
 ## Install
 
@@ -83,17 +83,17 @@ Press `prefix+i` to open the panel. Press it again, from any pane in the tab, to
 3. While the run goes, herdr's agent list shows `codex-cage · cage` with the stage under it: `prepare`, `implement 2/3`, `verify`, `review`, `publish`, or `implement try 2`.
 4. When it ends, the agent shows done with `PR opened`, or blocked with the failure code, such as `verify_failed`, and herdr shows a notification. The pane waits for Enter, then closes. The cage tab closes with its last pane.
 
-The list shows each issue's latest run under its title:
+The list shows each issue's latest run under its title. It reads `codex-cage runs list --json` every 2 seconds, so it shows every run in the repo, including runs an agent starts with codex-cage's delegate skill:
 
 | Mark | Meaning |
 | --- | --- |
-| `◐ implement 2/3` | Running, at this stage |
+| `◐ starting` | You pressed `c`, and codex-cage has not recorded the run yet |
+| `◐ implementing` | Running, with codex-cage's status: `cloning`, `setup`, `implementing`, `verifying`, `reviewing`, `creating pr` |
 | `✓ PR opened` | Done; the detail view shows the PR link |
 | `✗ verify_failed` | Failed with this code; run `codex-cage runs show <run-id>` in the repo for details |
-| `✗ crashed` | codex-cage exited without a result; the cage pane shows why |
-| `■ stopped` | Its pane was closed while it ran |
+| `■ interrupted` | It never finished, and its process is gone, for example because its pane was closed |
 
-Runs always use codex-cage's Docker mode. codex-cage itself knows nothing about herdr: `herdr-issues run <issue-url>` runs in the cage pane, starts `codex-cage run`, and mirrors the events codex-cage writes to `.codex-cage/runs/<run-id>/events.ndjson`. The run's state lives in `.codex-cage/runs/delegate-<issue number>.json`. That is the same file codex-cage's delegate skill writes, so runs an agent starts with that skill show up in the list too.
+Runs always use codex-cage's Docker mode. codex-cage itself knows nothing about herdr: `herdr-issues run <issue-url>` runs in the cage pane, starts `codex-cage run`, and mirrors the events codex-cage writes to `.codex-cage/runs/<run-id>/events.ndjson`. If codex-cage exits without a result, the cage pane and herdr's agent list show `crashed`.
 
 ## Mermaid
 

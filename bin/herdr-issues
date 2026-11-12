@@ -18,6 +18,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -591,9 +592,9 @@ def cmd_toggle():
 # `c` runs an issue with codex-cage (github.com/jhowliu/codex-cage) in a background
 # "cage" tab. codex-cage knows nothing about herdr: the cage pane runs
 # `herdr-issues run`, which starts `codex-cage run` and mirrors the run's events
-# (.codex-cage/runs/<run-id>/events.ndjson) into herdr's agent list. It keeps the
-# issue's run state in .codex-cage/runs/delegate-<n>.json for the panel. That is
-# the same file codex-cage's delegate skill writes, so its runs show up too.
+# (.codex-cage/runs/<run-id>/events.ndjson) into herdr's agent list. The list
+# reads run state from `codex-cage runs list --json`, so it shows every run in the
+# repo, however it was started.
 
 CODEX_CAGE = os.environ.get("CODEX_CAGE_BIN") or "codex-cage"
 CAGE_TAB = "cage"
@@ -601,6 +602,9 @@ CAGE_SOURCE = "herdr-issues"
 CAGE_AGENT = "codex-cage"
 RUN_POLL_SECONDS = 0.5
 RUNS_REFRESH_SECONDS = 2
+RUNS_LIST_TIMEOUT = 20
+PENDING_SECONDS = 120  # how long `c` shows "starting" while codex-cage has no record of the run
+GITHUB_ISSUE_URL = re.compile(r"^https://github\.com/([^/]+/[^/]+)/issues/(\d+)(?:[/?#]|$)")
 
 
 def repo_root(cwd):
@@ -620,10 +624,6 @@ def runs_dir(root):
     return os.path.join(root, ".codex-cage", "runs")
 
 
-def state_path(root, number):
-    return os.path.join(runs_dir(root), "delegate-%d.json" % number)
-
-
 def read_json(path):
     try:
         with open(path) as f:
@@ -633,55 +633,53 @@ def read_json(path):
         return None
 
 
-def write_json(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
-    os.replace(tmp, path)
+def run_states(root, repo=None):
+    """Issue number -> its latest codex-cage run, from `codex-cage runs list --json`.
 
-
-def pid_alive(pid):
+    Runs for another repo's issues, and Linear issues, are skipped. Any failure,
+    such as a codex-cage too old to have --json, reads as no runs."""
     try:
-        os.kill(int(pid), 0)
-        return True
-    except PermissionError:
-        return True  # it exists, under another user
-    except (OSError, ValueError, TypeError):
-        return False
-
-
-def run_states(root):
-    """Issue number -> the state of its latest run, from the delegate-<n>.json files."""
+        code, out, _ = run([CODEX_CAGE, "runs", "list", "--json"], cwd=root, timeout=RUNS_LIST_TIMEOUT)
+        runs = json.loads(out) if code == 0 else []
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {}
     states = {}
-    try:
-        names = os.listdir(runs_dir(root))
-    except OSError:
-        return states
-    for name in names:
-        m = re.match(r"^delegate-(\d+)\.json$", name)
-        data = read_json(os.path.join(runs_dir(root), name)) if m else None
-        if not data:
-            continue
-        if data.get("status") == "running" and not pid_alive(data.get("pid")):
-            data = dict(data, status="stopped")  # its pane was closed mid-run
-        states[int(m.group(1))] = data
+    for r in runs if isinstance(runs, list) else []:
+        m = GITHUB_ISSUE_URL.match(r.get("issueUrl") or "") if isinstance(r, dict) else None
+        if m and (repo is None or m.group(1).lower() == repo.lower()):
+            states.setdefault(int(m.group(2)), r)  # newest first, so the first is the latest
     return states
 
 
-def run_label(state):
-    """(glyph, text, colour pair) that the panel shows for a run state."""
-    status = state.get("status")
-    if status == "running":
-        return "◐", state.get("stage") or "running", 4
+def started_at(run):
+    try:
+        return datetime.fromisoformat((run.get("startedAt") or "").replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def run_label(run):
+    """(glyph, text, colour pair) that the panel shows for a run.
+
+    `run` is an entry of `codex-cage runs list --json`, {"status": "starting"}
+    while `c` waits for codex-cage to record the run, or the wrapper's final
+    result, which may be {"status": "crashed"}."""
+    status = run.get("status") or "unknown"
     if status == "succeeded":
         return "✓", "PR opened", 1
-    if status == "failed":
-        return "✗", state.get("failureCode") or "failed", 3
+    if status in ("failed", "guard_failed"):
+        return "✗", run.get("failureCode") or status, 3
     if status == "crashed":
         return "✗", "crashed", 3
-    return "■", "stopped", 0
+    if run.get("interrupted"):
+        return "■", "interrupted", 0  # it never finished, and its process is gone
+    if run.get("finishedAt"):
+        return "■", status, 0  # aborted, or a status this version does not know
+    return "◐", status.replace("_", " "), 4
+
+
+def run_active(run):
+    return bool(run) and run_label(run)[0] == "◐"
 
 
 class CageTracker:
@@ -845,14 +843,10 @@ def cmd_run(args):
     root = repo_root(os.getcwd()) or os.getcwd()
     pane_id = os.environ.get("HERDR_PANE_ID") if os.environ.get("HERDR_ENV") == "1" else None
     run_id = new_run_id()
-    state_file = state_path(root, number)
-    result_file = os.path.join(runs_dir(root), "%s.result.json" % run_id)
+    fd, result_file = tempfile.mkstemp(prefix="herdr-issues-%s-" % run_id, suffix=".json")
+    os.close(fd)  # codex-cage overwrites it; left empty, the run crashed
     tracker = CageTracker("#%d" % number)
     reporter = HerdrReporter(pane_id)
-
-    state = {"status": "running", "runId": run_id, "stage": tracker.stage, "issueUrl": url,
-             "pane": pane_id, "pid": os.getpid()}
-    write_json(state_file, state)
     reporter.send(tracker.started(run_id))
 
     # Docker mode always: a delegated run gets codex-cage's sandbox, whatever the config says.
@@ -873,11 +867,7 @@ def cmd_run(args):
         except KeyboardInterrupt:
             continue  # Ctrl-C reaches codex-cage too; let it stop and report
         for event in tail.read():
-            updates = tracker.updates_for(event)
-            reporter.send(updates)
-            if updates and state["stage"] != tracker.stage:
-                state["stage"] = tracker.stage
-                write_json(state_file, state)
+            reporter.send(tracker.updates_for(event))
 
     result = read_json(result_file)
     try:
@@ -888,8 +878,6 @@ def cmd_run(args):
         final = {k: result.get(k) for k in ("runId", "status", "failureCode", "prUrl")}
     else:
         final = {"runId": run_id, "status": "crashed", "exitCode": code}
-    final.update(issueUrl=url, pane=pane_id)
-    write_json(state_file, final)
     reporter.send(tracker.finished(final))
 
     glyph, label, _ = run_label(final)
@@ -930,8 +918,10 @@ class Panel:
         self._dcache = None
         self.flash = ("", 0.0)
         self.cage = None  # repo root when `c` can run issues with codex-cage
-        self.runs = {}  # issue number -> run state, see run_states()
+        self.runs = {}  # issue number -> its latest run, see run_states()
         self.runs_at = 0.0
+        self.runs_loading = False
+        self.pending = {}  # issue number -> when `c` started it, until codex-cage records the run
         self.lock = threading.Lock()
 
     # -- data
@@ -998,9 +988,30 @@ class Panel:
                     self.detail_error = str(e)
 
     def load_runs(self):
-        runs = run_states(self.cage) if self.cage else {}
-        with self.lock:
-            self.runs, self.runs_at = runs, time.time()
+        """Refreshes run states in the background: `codex-cage runs list` starts node."""
+        if self.runs_loading or not self.cage:
+            return
+        self.runs_loading, self.runs_at = True, time.time()
+        repo = (self.repo or {}).get("nameWithOwner")
+        threading.Thread(target=self._load_runs, args=(self.cage, repo), daemon=True).start()
+
+    def _load_runs(self, root, repo):
+        try:
+            runs = run_states(root, repo)
+            with self.lock:
+                self.runs = self.with_pending(runs, time.time())
+        finally:
+            self.runs_loading = False
+
+    def with_pending(self, runs, now):
+        """Shows issues just started with `c` as starting until codex-cage records their run."""
+        for number, pressed in list(self.pending.items()):
+            run = runs.get(number)
+            if (run and started_at(run) >= pressed) or now - pressed > PENDING_SECONDS:
+                del self.pending[number]
+            else:
+                runs[number] = {"status": "starting"}
+        return runs
 
     def current(self):
         rows = self.items.get(self.tab) or []
@@ -1060,9 +1071,12 @@ class Panel:
         if (item.get("state") or "").upper() != "OPEN":
             self.say("#%d is closed" % number)
             return
-        if (self.runs.get(number) or {}).get("status") == "running":
-            self.say("#%d is already running in the cage tab" % number)
-            return
+        with self.lock:
+            if run_active(self.runs.get(number)) or number in self.pending:
+                self.say("#%d is already running" % number)
+                return
+            self.pending[number] = time.time()
+            self.runs[number] = {"status": "starting"}
         self.say("checking #%d…" % number)
         threading.Thread(target=self._start_run, args=(number, item["url"], self.cage), daemon=True).start()
 
@@ -1078,12 +1092,19 @@ class Panel:
             if not result.get("ready"):
                 errors = [f.get("message") for f in findings if f.get("level") == "error"]
                 self.say("#%d not ready: %s" % (number, errors[0] if errors else "run codex-cage check"))
+                self.cancel_pending(number)
                 return
             herdr("pane", "run", cage_pane(root), start_run_command(url))
             warnings = sum(1 for f in findings if f.get("level") == "warning")
             self.say("#%d started in the cage tab%s" % (number, " · %d check warnings" % warnings if warnings else ""))
         except Exception as e:  # shown in the footer instead of crashing the panel
             self.say("run failed: %s" % e)
+            self.cancel_pending(number)
+
+    def cancel_pending(self, number):
+        with self.lock:
+            self.pending.pop(number, None)
+            self.runs_at = 0.0  # reload, so the issue's previous run shows again
 
     def target_agent(self):
         me, tab = os.environ.get("HERDR_PANE_ID"), os.environ.get("HERDR_TAB_ID")
