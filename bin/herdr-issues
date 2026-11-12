@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """herdr-issues: a GitHub issues / PRs panel docked beside your agents.
 
-  herdr-issues toggle            open the panel right of the focused pane, or close it
+  herdr-issues toggle            open the panel right of the focused pane, or close it;
+                                 beside a narrow pane it opens zoomed (z un-zooms it)
   herdr-issues panel             the TUI (run by herdr inside the plugin pane)
   herdr-issues run <issue-url>   run the issue with agent-cage and show its progress
                                  in herdr (what `c` starts in the cage tab)
@@ -30,6 +31,8 @@ STATE_DIR = os.environ.get("HERDR_PLUGIN_STATE_DIR") or os.path.expanduser("~/.l
 PANELS_FILE = os.path.join(STATE_DIR, "panels.json")  # tab id -> panel pane id
 REFRESH_SECONDS = 60
 PANEL_WIDTH = 0.36  # share of the split the panel ends up with
+ZOOM_BELOW = 120  # toggle opens the panel zoomed beside a pane narrower than this
+NARROW_WIDTH = 46  # a panel narrower than this wraps titles and drops the age column
 
 # ---------------------------------------------------------------- helpers
 
@@ -69,8 +72,9 @@ def load_panels():
 
 def save_panels(panels):
     os.makedirs(STATE_DIR, exist_ok=True)
-    tmp = PANELS_FILE + ".tmp"
-    with open(tmp, "w") as f:
+    # Its own temp file, so panels starting at the same time never race on one.
+    fd, tmp = tempfile.mkstemp(dir=STATE_DIR, prefix="panels.", suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
         json.dump(panels, f)
     os.replace(tmp, PANELS_FILE)
 
@@ -539,6 +543,19 @@ def focused_pane():
     raise RuntimeError("no focused pane")
 
 
+def pane_width(pane_id):
+    try:
+        layout = herdr("pane", "layout", "--pane", pane_id)["layout"]
+        return next(p["rect"]["width"] for p in layout["panes"] if p["pane_id"] == pane_id)
+    except (RuntimeError, KeyError, StopIteration):
+        return None
+
+
+def panel_placement(width):
+    """Beside a narrow pane, a side split would be too thin to read, so open zoomed."""
+    return "zoomed" if width is not None and width < ZOOM_BELOW else "split"
+
+
 def find_pane_id(obj):
     """Pull the new pane id out of a `plugin pane open` result, whatever its nesting."""
     if isinstance(obj, dict):
@@ -575,7 +592,7 @@ def cmd_toggle():
     result = herdr(
         "plugin", "pane", "open",
         "--plugin", PLUGIN_ID, "--entrypoint", "panel",
-        "--placement", "split", "--direction", "right",
+        "--placement", panel_placement(pane_width(src["pane_id"])), "--direction", "right",
         "--target-pane", src["pane_id"], "--cwd", cwd, "--focus",
     )
     new_id = find_pane_id(result)
@@ -922,6 +939,7 @@ class Panel:
         self.runs_at = 0.0
         self.runs_loading = False
         self.pending = {}  # issue number -> when `c` started it, until agent-cage records the run
+        self.help = False  # the key list, opened with ?
         self.lock = threading.Lock()
 
     # -- data
@@ -1126,7 +1144,9 @@ class Panel:
             scr.refresh()
             return
         with self.lock:
-            if self.detail:
+            if self.help:
+                self.draw_help(scr, h, w)
+            elif self.detail:
                 self.draw_detail(scr, h, w)
             else:
                 self.draw_list(scr, h, w)
@@ -1134,13 +1154,17 @@ class Panel:
         scr.refresh()
 
     def draw_header(self, scr, w):
+        narrow = w < NARROW_WIDTH
         name = self.repo["nameWithOwner"] if self.repo else os.path.basename(self.cwd.rstrip("/")) or self.cwd
+        if narrow:
+            name = name.split("/")[-1]  # the owner is the first thing to go
         status = "loading…" if self.loading else (time.strftime("%H:%M", time.localtime(self.fetched_at)) if self.fetched_at else "")
         put(scr, 0, 1, truncate(name, w - text_width(status) - 4), curses.A_BOLD)
         put(scr, 0, w - text_width(status) - 1, status, curses.A_DIM)
         x = 1
         for t in TABS:
-            label = " %s %d " % ("Issues" if t == "issues" else "PRs", len(self.items.get(t) or []))
+            names = ("I", "P") if narrow else ("Issues", "PRs")
+            label = " %s %d " % (names[0] if t == "issues" else names[1], len(self.items.get(t) or []))
             attr = curses.A_REVERSE | curses.A_BOLD if t == self.tab else curses.A_DIM
             put(scr, 1, x, label, attr)
             x += text_width(label) + 1
@@ -1159,37 +1183,62 @@ class Panel:
             msg = "loading…" if self.loading or not self.loaded_once else "no %s %s" % (self.filter, "issues" if self.tab == "issues" else "PRs")
             put(scr, top_y, 1, msg, curses.A_DIM)
             return
-        per = 2  # lines per item
-        visible = max(1, (bottom_y - top_y) // per)
+        heights = {}
+
+        def height(i):
+            if i not in heights:
+                heights[i] = len(self.item_lines(rows[i], w))
+            return heights[i]
+
+        # Items differ in height once titles wrap, so scroll until the selection fits.
         if self.sel < self.top:
             self.top = self.sel
-        elif self.sel >= self.top + visible:
-            self.top = self.sel - visible + 1
-        for i, item in enumerate(rows[self.top: self.top + visible]):
-            idx = self.top + i
-            y = top_y + i * per
-            selected = idx == self.sel
-            num = "#%d" % item["number"]
+        while self.top < self.sel and sum(height(i) for i in range(self.top, self.sel + 1)) > bottom_y - top_y:
+            self.top += 1
+        y = top_y
+        for idx in range(self.top, len(rows)):
+            lines = self.item_lines(rows[idx], w)
+            if y + len(lines) > bottom_y and idx != self.top:
+                break
+            base = curses.A_REVERSE if idx == self.sel else 0
+            for j, segs in enumerate(lines):
+                if y + j >= bottom_y:
+                    break
+                if base:
+                    put(scr, y + j, 0, " " * w, base)
+                for x, text, attr in segs:
+                    put(scr, y + j, x, text, attr | base)
+            y += len(lines)
+
+    def item_lines(self, item, w):
+        """The lines one list item takes, each a list of (x, text, attr).
+
+        A narrow panel wraps the title onto a second line and drops the age column."""
+        num = "#%d" % item["number"]
+        mark_attr, mark = self.state_mark(item)
+        tx = 4 + len(num)
+        title = item.get("title", "")
+        if w < NARROW_WIDTH:
+            parts = wrap(title, w - tx - 1)
+            if len(parts) > 2:
+                parts = [parts[0], truncate(" ".join(parts[1:]), w - tx - 1)]
+            lines = [[(1, mark, mark_attr), (3, num, curses.A_BOLD), (tx, parts[0], 0)]]
+            lines += [[(tx, part, 0)] for part in parts[1:]]
+        else:
             age = ago(item.get("updatedAt"))
-            mark_attr, mark = self.state_mark(item)
-            base = curses.A_REVERSE if selected else 0
-            if selected:
-                put(scr, y, 0, " " * w, base)
-                put(scr, y + 1, 0, " " * w, base)
-            put(scr, y, 1, mark, mark_attr | base)
-            put(scr, y, 3, num, curses.A_BOLD | base)
-            tx = 4 + len(num)
-            put(scr, y, tx, truncate(item.get("title", ""), w - tx - len(age) - 2), base)
-            put(scr, y, w - len(age) - 1, age, curses.A_DIM | base)
-            sx = 3
-            run_state = self.runs.get(item["number"]) if self.tab == "issues" else None
-            if run_state:  # the agent-cage run, ahead of labels and assignees
-                glyph, label, pair = run_label(run_state)
-                tag = "%s %s" % (glyph, label)
-                put(scr, y + 1, sx, truncate(tag, w - sx - 1), (color(pair) if pair else curses.A_DIM) | base)
-                sx += text_width(tag) + 2
-            if sx < w - 1:
-                put(scr, y + 1, sx, truncate(self.subline(item), w - sx - 1), self.sub_attr(item) | base)
+            lines = [[(1, mark, mark_attr), (3, num, curses.A_BOLD),
+                      (tx, truncate(title, w - tx - len(age) - 2), 0),
+                      (w - len(age) - 1, age, curses.A_DIM)]]
+        meta, sx = [], 3
+        run_state = self.runs.get(item["number"]) if self.tab == "issues" else None
+        if run_state:  # the agent-cage run, ahead of labels and assignees
+            glyph, label, pair = run_label(run_state)
+            tag = "%s %s" % (glyph, label)
+            meta.append((sx, truncate(tag, w - sx - 1), color(pair) if pair else curses.A_DIM))
+            sx += text_width(tag) + 2
+        if sx < w - 1:
+            meta.append((sx, truncate(self.subline(item), w - sx - 1), self.sub_attr(item)))
+        return lines + [meta]
 
     def state_mark(self, item):
         state = (item.get("state") or "").upper()
@@ -1284,18 +1333,74 @@ class Panel:
         if msg and time.time() - at < 4:
             put(scr, h - 1, 1, truncate(msg, w - 2), color(4))
             return
+        put(scr, h - 1, 1, truncate(self.footer_hint(w), w - 2), curses.A_DIM)
+
+    def can_run(self):
         kind = self.detail[0] if self.detail else self.tab
-        run_hint = "c run  " if self.cage and kind == "issues" else ""
+        return bool(self.cage) and kind == "issues"
+
+    def footer_hint(self, w):
+        """The longest key hint that fits; ? lists the rest."""
+        if self.help:
+            return "any key closes"
+        run_hint = "c run  " if self.can_run() else ""
         if self.detail:
-            hint = "j/k line  h/l page  o browser  p →agent  %sq back" % run_hint
+            hints = ("j/k line  h/l page  o browser  p →agent  %sz zoom  q back" % run_hint,
+                     "h/l page  %sz zoom  ? keys  q back" % run_hint,
+                     "? keys  q back")
         else:
-            hint = "⏎ view  o browser  p →agent  %stab issues/PRs  f filter  r refresh  q quit" % run_hint
-        put(scr, h - 1, 1, truncate(hint, w - 2), curses.A_DIM)
+            hints = ("⏎ view  h/l issues/PRs  o browser  p →agent  %sf filter  r refresh  z zoom  q quit" % run_hint,
+                     "⏎ view  h/l tabs  %sz zoom  ? keys  q quit" % run_hint,
+                     "? keys  q quit")
+        return next((hint for hint in hints if text_width(hint) <= w - 2), hints[-1])
+
+    def key_list(self):
+        run = [("c", "run with agent-cage")] if self.can_run() else []
+        if self.detail:
+            return [("j / k", "line down / up"), ("h / l", "page up / down"), ("g / G", "top / bottom"),
+                    ("o", "open in browser"), ("p", "paste into the agent")] + run + [
+                    ("z", "zoom the panel"), ("q", "back to the list")]
+        return [("⏎", "open"), ("j / k", "down / up"), ("g / G", "first / last"),
+                ("h / l", "issues / PRs (tab too)"), ("f", "filter: open, closed, all"), ("r", "refresh"),
+                ("o", "open in browser"), ("p", "paste into the agent")] + run + [
+                ("z", "zoom the panel"), ("q", "quit")]
+
+    def draw_help(self, scr, h, w):
+        put(scr, 0, 1, "keys", curses.A_BOLD)
+        keys = self.key_list()
+        kw = max(text_width(k) for k, _ in keys) + 2
+        for i, (key, what) in enumerate(keys[: h - 3]):
+            put(scr, 2 + i, 1, key, curses.A_BOLD)
+            put(scr, 2 + i, 1 + kw, truncate(what, w - kw - 2), curses.A_DIM)
+
+    def zoom(self):
+        pane = os.environ.get("HERDR_PANE_ID")
+        if not pane:
+            self.say("z works inside herdr")
+            return
+        try:
+            herdr("pane", "zoom", pane, "--toggle")
+        except RuntimeError as e:
+            self.say("zoom failed: %s" % e)
 
     # -- input
 
+    def switch_tab(self, tab):
+        if tab != self.tab:
+            self.tab = tab
+            self.sel = self.top = 0
+
     def handle(self, key, h):
         """Return False to quit."""
+        if self.help:
+            self.help = False  # any key closes the key list
+            return True
+        if key == "?":
+            self.help = True
+            return True
+        if key == "z":
+            self.zoom()
+            return True
         if self.detail:
             page = max(1, h - 3)
             if key in ("j", curses.KEY_DOWN):
@@ -1330,11 +1435,14 @@ class Panel:
             self.sel = 0
         elif key == "G":
             self.sel = n - 1
-        elif key in ("\n", "\r", "l", curses.KEY_ENTER, curses.KEY_RIGHT):
+        elif key in ("\n", "\r", curses.KEY_ENTER):
             self.open_detail()
+        elif key in ("h", curses.KEY_LEFT):  # the tabs sit left to right in the header
+            self.switch_tab("issues")
+        elif key in ("l", curses.KEY_RIGHT):
+            self.switch_tab("prs")
         elif key in ("\t", "]", "["):
-            self.tab = TABS[(TABS.index(self.tab) + 1) % len(TABS)]
-            self.sel = self.top = 0
+            self.switch_tab(TABS[(TABS.index(self.tab) + 1) % len(TABS)])
         elif key == "f":
             self.filter = FILTERS[(FILTERS.index(self.filter) + 1) % len(FILTERS)]
             self.sel = self.top = 0

@@ -47,19 +47,23 @@ Without it, mermaid blocks show as source.
 
 Press `prefix+i` to open the panel. Press it again, from any pane in the tab, to close it.
 
+The panel opens to the right of the focused pane. Beside a pane narrower than 120 columns it opens zoomed, filling the tab, so the panel is never squeezed; press `z` to un-zoom it. Below 46 columns the list wraps each title onto two lines and drops the age column, and the footer shortens to the keys that fit. `?` lists every key.
+
 **List**
 
 | Key | Action |
 | --- | --- |
 | `j` / `k` | Move down / up |
 | `g` / `G` | Jump to top / bottom |
-| `Enter` / `l` | Open the issue or PR |
-| `Tab` | Switch between issues and PRs |
+| `Enter` | Open the issue or PR |
+| `h` / `l` | Switch to issues / PRs (`Tab` switches too) |
 | `f` | Filter: open → closed → all |
 | `r` | Refresh (it also refreshes every 60s) |
 | `o` | Open in the browser |
 | `p` | Send to the agent in this tab |
 | `c` | Run the issue with agent-cage |
+| `z` | Zoom the panel to fill the tab, or un-zoom it |
+| `?` | List the keys (any key closes it) |
 | `q` | Close the panel |
 
 **Detail**
@@ -72,6 +76,8 @@ Press `prefix+i` to open the panel. Press it again, from any pane in the tab, to
 | `o` | Open in the browser |
 | `p` | Send to the agent in this tab |
 | `c` | Run the issue with agent-cage |
+| `z` | Zoom the panel to fill the tab, or un-zoom it |
+| `?` | List the keys (any key closes it) |
 | `q` / `Esc` | Back to the list |
 
 ## Run issues with agent-cage
