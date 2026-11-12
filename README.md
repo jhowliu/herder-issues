@@ -55,8 +55,8 @@ The panel opens to the right of the focused pane. Beside a pane narrower than 12
 | --- | --- |
 | `j` / `k` | Move down / up |
 | `g` / `G` | Jump to top / bottom |
-| `Enter` / `l` | Open the issue or PR |
-| `Tab` | Switch between issues and PRs |
+| `Enter` | Open the issue or PR |
+| `h` / `l` | Switch to issues / PRs (`Tab` switches too) |
 | `f` | Filter: open → closed → all |
 | `r` | Refresh (it also refreshes every 60s) |
 | `o` | Open in the browser |

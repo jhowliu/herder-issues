@@ -1349,8 +1349,8 @@ class Panel:
                      "h/l page  %sz zoom  ? keys  q back" % run_hint,
                      "? keys  q back")
         else:
-            hints = ("⏎ view  o browser  p →agent  %stab issues/PRs  f filter  r refresh  z zoom  q quit" % run_hint,
-                     "⏎ view  %sz zoom  ? keys  q quit" % run_hint,
+            hints = ("⏎ view  h/l issues/PRs  o browser  p →agent  %sf filter  r refresh  z zoom  q quit" % run_hint,
+                     "⏎ view  h/l tabs  %sz zoom  ? keys  q quit" % run_hint,
                      "? keys  q quit")
         return next((hint for hint in hints if text_width(hint) <= w - 2), hints[-1])
 
@@ -1360,8 +1360,8 @@ class Panel:
             return [("j / k", "line down / up"), ("h / l", "page up / down"), ("g / G", "top / bottom"),
                     ("o", "open in browser"), ("p", "paste into the agent")] + run + [
                     ("z", "zoom the panel"), ("q", "back to the list")]
-        return [("⏎ / l", "open"), ("j / k", "down / up"), ("g / G", "first / last"),
-                ("tab", "issues / PRs"), ("f", "filter: open, closed, all"), ("r", "refresh"),
+        return [("⏎", "open"), ("j / k", "down / up"), ("g / G", "first / last"),
+                ("h / l", "issues / PRs (tab too)"), ("f", "filter: open, closed, all"), ("r", "refresh"),
                 ("o", "open in browser"), ("p", "paste into the agent")] + run + [
                 ("z", "zoom the panel"), ("q", "quit")]
 
@@ -1384,6 +1384,11 @@ class Panel:
             self.say("zoom failed: %s" % e)
 
     # -- input
+
+    def switch_tab(self, tab):
+        if tab != self.tab:
+            self.tab = tab
+            self.sel = self.top = 0
 
     def handle(self, key, h):
         """Return False to quit."""
@@ -1430,11 +1435,14 @@ class Panel:
             self.sel = 0
         elif key == "G":
             self.sel = n - 1
-        elif key in ("\n", "\r", "l", curses.KEY_ENTER, curses.KEY_RIGHT):
+        elif key in ("\n", "\r", curses.KEY_ENTER):
             self.open_detail()
+        elif key in ("h", curses.KEY_LEFT):  # the tabs sit left to right in the header
+            self.switch_tab("issues")
+        elif key in ("l", curses.KEY_RIGHT):
+            self.switch_tab("prs")
         elif key in ("\t", "]", "["):
-            self.tab = TABS[(TABS.index(self.tab) + 1) % len(TABS)]
-            self.sel = self.top = 0
+            self.switch_tab(TABS[(TABS.index(self.tab) + 1) % len(TABS)])
         elif key == "f":
             self.filter = FILTERS[(FILTERS.index(self.filter) + 1) % len(FILTERS)]
             self.sel = self.top = 0

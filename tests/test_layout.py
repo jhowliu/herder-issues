@@ -65,13 +65,13 @@ class FooterTest(unittest.TestCase):
         panel.cage = "/repo"
 
         self.assertIn("f filter", panel.footer_hint(120))
-        self.assertEqual(panel.footer_hint(68), "⏎ view  c run  z zoom  ? keys  q quit")
+        self.assertEqual(panel.footer_hint(68), "⏎ view  h/l tabs  c run  z zoom  ? keys  q quit")
         self.assertEqual(panel.footer_hint(30), "? keys  q quit")
 
     def test_c_is_listed_only_when_issues_can_run(self):
         panel = hi.Panel("/nonexistent")
 
-        self.assertEqual(panel.footer_hint(68), "⏎ view  z zoom  ? keys  q quit")
+        self.assertEqual(panel.footer_hint(68), "⏎ view  h/l tabs  z zoom  ? keys  q quit")
         self.assertNotIn("c", [key for key, _ in panel.key_list()])
         panel.cage = "/repo"
         self.assertIn("c", [key for key, _ in panel.key_list()])
@@ -83,6 +83,31 @@ class FooterTest(unittest.TestCase):
         self.assertTrue(panel.help)
         self.assertTrue(panel.handle("q", 40), "q closes the key list instead of quitting")
         self.assertFalse(panel.help)
+
+
+class TabKeysTest(unittest.TestCase):
+    def test_h_and_l_move_between_the_tabs_in_the_header(self):
+        panel = hi.Panel("/nonexistent")
+        panel.items["issues"] = [ISSUE, dict(ISSUE, number=115)]
+        panel.sel = 1
+
+        panel.handle("l", 40)
+        self.assertEqual((panel.tab, panel.sel, panel.detail), ("prs", 0, None), "l switches, it does not open")
+        panel.handle("l", 40)
+        self.assertEqual(panel.tab, "prs", "l stays on the last tab")
+        panel.handle("h", 40)
+        self.assertEqual(panel.tab, "issues")
+        panel.handle("\t", 40)
+        self.assertEqual(panel.tab, "prs", "tab still switches")
+
+    def test_in_the_detail_view_h_and_l_still_page(self):
+        panel = hi.Panel("/nonexistent")
+        panel.detail = ("issues", 116)
+
+        panel.handle("l", 40)
+        self.assertEqual((panel.tab, panel.dscroll), ("issues", 37))
+        panel.handle("h", 40)
+        self.assertEqual(panel.dscroll, 0)
 
 
 class PlacementTest(unittest.TestCase):
